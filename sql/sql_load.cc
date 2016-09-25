@@ -1,6 +1,6 @@
 /*
-   Copyright (c) 2000, 2014, Oracle and/or its affiliates.
-   Copyright (c) 2010, 2014, SkySQL Ab.
+   Copyright (c) 2000, 2016, Oracle and/or its affiliates.
+   Copyright (c) 2010, 2016, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -99,7 +99,7 @@ public:
   /* load xml */
   List<XML_TAG> taglist;
   int read_value(int delim, String *val);
-  int read_xml();
+  int read_xml(THD *thd);
   int clear_level(int level);
 
   my_off_t file_length() { return cache.end_of_file; }
@@ -240,6 +240,7 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
   {
     DBUG_RETURN(TRUE);
   }
+  thd_proc_info(thd, "executing");
   /*
     Let us emit an error if we are loading data to table which is used
     in subselect in SET clause like we do it for INSERT.
@@ -270,7 +271,7 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
       Item *item;
       if (!(item= field_iterator.create_item(thd)))
         DBUG_RETURN(TRUE);
-      fields_vars.push_back(item->real_item());
+      fields_vars.push_back(item->real_item(), thd->mem_root);
     }
     bitmap_set_all(table->write_set);
     /*
@@ -295,9 +296,24 @@ int mysql_load(THD *thd,sql_exchange *ex,TABLE_LIST *table_list,
     if (setup_fields(thd, 0, set_values, MARK_COLUMNS_READ, 0, 0))
       DBUG_RETURN(TRUE);
   }
+  switch_to_nullable_trigger_fields(fields_vars, table);
+  switch_to_nullable_trigger_fields(set_fields, table);
+  switch_to_nullable_trigger_fields(set_values, table);
 
   table->prepare_triggers_for_insert_stmt_or_event();
   table->mark_columns_needed_for_insert();
+
+  if (table->vfield)
+  {
+    for (Field **vfield_ptr= table->vfield; *vfield_ptr; vfield_ptr++)
+    {
+      if ((*vfield_ptr)->stored_in_db)
+      {
+        thd->lex->unit.insert_table_with_stored_vcol= table;
+        break;
+      }
+    }
+  }
 
   uint tot_length=0;
   bool use_blobs= 0, use_vars= 0;
@@ -755,7 +771,7 @@ read_fixed_length(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
   List_iterator_fast<Item> it(fields_vars);
   Item_field *sql_field;
   TABLE *table= table_list->table;
-  bool err, progress_reports;
+  bool err, progress_reports, auto_increment_field_not_null=false;
   ulonglong counter, time_to_report_progress;
   DBUG_ENTER("read_fixed_length");
 
@@ -764,6 +780,12 @@ read_fixed_length(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
   progress_reports= 1;
   if ((thd->progress.max_counter= read_info.file_length()) == ~(my_off_t) 0)
     progress_reports= 0;
+
+  while ((sql_field= (Item_field*) it++))
+  {
+    if (table->field[sql_field->field->field_index] == table->next_number_field)
+      auto_increment_field_not_null= true;
+  }
 
   while (!read_info.read_fixed_length())
   {
@@ -807,8 +829,7 @@ read_fixed_length(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
     while ((sql_field= (Item_field*) it++))
     {
       Field *field= sql_field->field;                  
-      if (field == table->next_number_field)
-        table->auto_increment_field_not_null= TRUE;
+      table->auto_increment_field_not_null= auto_increment_field_not_null;
       /*
         No fields specified in fields_vars list can be null in this format.
         Mark field as not null, we should do this for each row because of
@@ -862,8 +883,7 @@ read_fixed_length(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
         (table->default_field && table->update_default_fields()))
       DBUG_RETURN(1);
 
-    switch (table_list->view_check_option(thd,
-                                          ignore_check_option_errors)) {
+    switch (table_list->view_check_option(thd, ignore_check_option_errors)) {
     case VIEW_CHECK_SKIP:
       read_info.next_line();
       goto continue_loop;
@@ -1151,7 +1171,7 @@ read_xml_field(THD *thd, COPY_INFO &info, TABLE_LIST *table_list,
     }
     
     // read row tag and save values into tag list
-    if (read_info.read_xml())
+    if (read_info.read_xml(thd))
       break;
     
     List_iterator_fast<XML_TAG> xmlit(read_info.taglist);
@@ -1367,7 +1387,7 @@ READ_INFO::READ_INFO(File file_par, uint tot_length, CHARSET_INFO *cs,
   set_if_bigger(length,line_start.length());
   stack=stack_pos=(int*) sql_alloc(sizeof(int)*length);
 
-  if (!(buffer=(uchar*) my_malloc(buff_length+1,MYF(MY_THREAD_SPECIFIC))))
+  if (!(buffer=(uchar*) my_malloc(buff_length+1,MYF(MY_WME | MY_THREAD_SPECIFIC))))
     error=1; /* purecov: inspected */
   else
   {
@@ -1553,37 +1573,50 @@ int READ_INFO::read_field()
 	}
       }
 #ifdef USE_MB
-      if (my_mbcharlen(read_charset, chr) > 1 &&
-          to + my_mbcharlen(read_charset, chr) <= end_of_buff)
-      {
-        uchar* p= to;
-        int ml, i;
-        *to++ = chr;
-
-        ml= my_mbcharlen(read_charset, chr);
-
-        for (i= 1; i < ml; i++) 
+        uint ml= my_mbcharlen(read_charset, chr);
+        if (ml == 0)
         {
-          chr= GET;
-          if (chr == my_b_EOF)
-          {
-            /*
-             Need to back up the bytes already ready from illformed
-             multi-byte char 
-            */
-            to-= i;
-            goto found_eof;
-          }
-          *to++ = chr;
+          *to= '\0';
+          my_error(ER_INVALID_CHARACTER_STRING, MYF(0),
+                   read_charset->csname, buffer);
+          error= true;
+          return 1;
         }
-        if (my_ismbchar(read_charset,
+
+        if (ml > 1 &&
+            to + ml <= end_of_buff)
+        {
+          uchar* p= to;
+          *to++ = chr;
+
+          for (uint i= 1; i < ml; i++)
+          {
+            chr= GET;
+            if (chr == my_b_EOF)
+            {
+              /*
+                Need to back up the bytes already ready from illformed
+                multi-byte char 
+              */
+              to-= i;
+              goto found_eof;
+            }
+            *to++ = chr;
+          }
+          if (my_ismbchar(read_charset,
                         (const char *)p,
                         (const char *)to))
-          continue;
-        for (i= 0; i < ml; i++)
-          PUSH(*--to);
-        chr= GET;
-      }
+            continue;
+          for (uint i= 0; i < ml; i++)
+            PUSH(*--to);
+          chr= GET;
+        }
+        else if (ml > 1)
+        {
+          // Buffer is too small, exit while loop, and reallocate.
+          PUSH(chr);
+          break;
+        }
 #endif
       *to++ = (uchar) chr;
     }
@@ -1827,7 +1860,15 @@ int READ_INFO::read_value(int delim, String *val)
   for (chr= GET; my_tospace(chr) != delim && chr != my_b_EOF;)
   {
 #ifdef USE_MB
-    if (my_mbcharlen(read_charset, chr) > 1)
+    uint ml= my_mbcharlen(read_charset, chr);
+    if (ml == 0)
+    {
+      chr= my_b_EOF;
+      val->length(0);
+      return chr;
+    }
+
+    if (ml > 1)
     {
       DBUG_PRINT("read_xml",("multi byte"));
       int i, ml= my_mbcharlen(read_charset, chr);
@@ -1875,7 +1916,7 @@ int READ_INFO::read_value(int delim, String *val)
   tags and attributes are stored in taglist
   when tag set in ROWS IDENTIFIED BY is closed, we are ready and return
 */
-int READ_INFO::read_xml()
+int READ_INFO::read_xml(THD *thd)
 {
   DBUG_ENTER("READ_INFO::read_xml");
   int chr, chr2, chr3;
@@ -1973,11 +2014,13 @@ int READ_INFO::read_xml()
         goto found_eof;
       
       /* save value to list */
-      if(tag.length() > 0 && value.length() > 0)
+      if (tag.length() > 0 && value.length() > 0)
       {
         DBUG_PRINT("read_xml", ("lev:%i tag:%s val:%s",
                                 level,tag.c_ptr_safe(), value.c_ptr_safe()));
-        taglist.push_front( new XML_TAG(level, tag, value));
+        XML_TAG *tmp= new XML_TAG(level, tag, value);
+        if (!tmp || taglist.push_front(tmp, thd->mem_root))
+          DBUG_RETURN(1);                       // End of memory
       }
       tag.length(0);
       value.length(0);
@@ -1985,8 +2028,15 @@ int READ_INFO::read_xml()
       break;
       
     case '/': /* close tag */
-      level--;
       chr= my_tospace(GET);
+      /* Decrease the 'level' only when (i) It's not an */
+      /* (without space) empty tag i.e. <tag/> or, (ii) */
+      /* It is of format <row col="val" .../>           */
+      if(chr != '>' || in_tag)
+      {
+        level--;
+        in_tag= false;
+      }
       if(chr != '>')   /* if this is an empty tag <tag   /> */
         tag.length(0); /* we should keep tag value          */
       while(chr != '>' && chr != my_b_EOF)
@@ -2037,13 +2087,15 @@ int READ_INFO::read_xml()
       }
       
       chr= read_value(delim, &value);
-      if(attribute.length() > 0 && value.length() > 0)
+      if (attribute.length() > 0 && value.length() > 0)
       {
         DBUG_PRINT("read_xml", ("lev:%i att:%s val:%s\n",
                                 level + 1,
                                 attribute.c_ptr_safe(),
                                 value.c_ptr_safe()));
-        taglist.push_front(new XML_TAG(level + 1, attribute, value));
+        XML_TAG *tmp= new XML_TAG(level + 1, attribute, value);
+        if (!tmp || taglist.push_front(tmp, thd->mem_root))
+          DBUG_RETURN(1);                       // End of memory
       }
       attribute.length(0);
       value.length(0);

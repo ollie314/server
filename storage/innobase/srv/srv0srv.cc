@@ -1,9 +1,9 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2014, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2016, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2008, 2009 Google Inc.
 Copyright (c) 2009, Percona Inc.
-Copyright (c) 2013, 2015, MariaDB Corporation. All Rights Reserved.
+Copyright (c) 2013, 2016, MariaDB Corporation.
 
 Portions of this file contain modifications contributed and copyrighted by
 Google, Inc. Those modifications are gratefully acknowledged and are described
@@ -140,6 +140,9 @@ UNIV_INTERN ulint	srv_file_format = 0;
 UNIV_FORMAT_MAX + 1 means no checking ie. FALSE.  The default is to
 set it to the highest format we support. */
 UNIV_INTERN ulint	srv_max_file_format_at_startup = UNIV_FORMAT_MAX;
+/** Set if InnoDB operates in read-only mode or innodb-force-recovery
+is greater than SRV_FORCE_NO_TRX_UNDO. */
+UNIV_INTERN my_bool	high_level_read_only;
 
 #if UNIV_FORMAT_A
 # error "UNIV_FORMAT_A must be 0!"
@@ -158,6 +161,7 @@ OS (provided we compiled Innobase with it in), otherwise we will
 use simulated aio we build below with threads.
 Currently we support native aio on windows and linux */
 UNIV_INTERN my_bool	srv_use_native_aio = TRUE;
+UNIV_INTERN my_bool	srv_numa_interleave = FALSE;
 
 /* If this flag is TRUE, then we will use fallocate(PUCH_HOLE)
 to the pages */
@@ -259,6 +263,8 @@ UNIV_INTERN ulong	srv_flush_neighbors	= 1;
 UNIV_INTERN ulint	srv_buf_pool_old_size;
 /* current size in kilobytes */
 UNIV_INTERN ulint	srv_buf_pool_curr_size	= 0;
+/* dump that may % of each buffer pool during BP dump */
+UNIV_INTERN ulong	srv_buf_pool_dump_pct;
 /* size in bytes */
 UNIV_INTERN ulint	srv_mem_pool_size	= ULINT_MAX;
 UNIV_INTERN ulint	srv_lock_table_size	= ULINT_MAX;
@@ -1543,6 +1549,7 @@ srv_export_innodb_status(void)
 	export_vars.innodb_pages_created = stat.n_pages_created;
 
 	export_vars.innodb_pages_read = stat.n_pages_read;
+	export_vars.innodb_page0_read = srv_stats.page0_read;
 
 	export_vars.innodb_pages_written = stat.n_pages_written;
 
@@ -1680,7 +1687,7 @@ extern "C" UNIV_INTERN
 os_thread_ret_t
 DECLARE_THREAD(srv_monitor_thread)(
 /*===============================*/
-	void*	arg __attribute__((unused)))
+	void*	arg MY_ATTRIBUTE((unused)))
 			/*!< in: a dummy parameter required by
 			os_thread_create */
 {
@@ -1850,12 +1857,14 @@ exit_func:
 /*********************************************************************//**
 A thread which prints warnings about semaphore waits which have lasted
 too long. These can be used to track bugs which cause hangs.
+Note: In order to make sync_arr_wake_threads_if_sema_free work as expected,
+we should avoid waiting any mutexes in this function!
 @return	a dummy parameter */
 extern "C" UNIV_INTERN
 os_thread_ret_t
 DECLARE_THREAD(srv_error_monitor_thread)(
 /*=====================================*/
-	void*	arg __attribute__((unused)))
+	void*	arg MY_ATTRIBUTE((unused)))
 			/*!< in: a dummy parameter required by
 			os_thread_create */
 {
@@ -1889,23 +1898,21 @@ loop:
 	/* Try to track a strange bug reported by Harald Fuchs and others,
 	where the lsn seems to decrease at times */
 
-        /* We have to use nowait to ensure we don't block */
-	new_lsn= log_get_lsn_nowait();
+	if (log_peek_lsn(&new_lsn)) {
+		if (new_lsn < old_lsn) {
+			ut_print_timestamp(stderr);
+			fprintf(stderr,
+				"  InnoDB: Error: old log sequence number " LSN_PF
+				" was greater\n"
+				"InnoDB: than the new log sequence number " LSN_PF "!\n"
+				"InnoDB: Please submit a bug report"
+				" to http://bugs.mysql.com\n",
+				old_lsn, new_lsn);
+			ut_ad(0);
+		}
 
-	if (new_lsn && new_lsn < old_lsn) {
-		ut_print_timestamp(stderr);
-		fprintf(stderr,
-			"  InnoDB: Error: old log sequence number " LSN_PF
-			" was greater\n"
-			"InnoDB: than the new log sequence number " LSN_PF "!\n"
-			"InnoDB: Please submit a bug report"
-			" to http://bugs.mysql.com\n",
-			old_lsn, new_lsn);
-		ut_ad(0);
-	}
-
-        if (new_lsn)
 		old_lsn = new_lsn;
+	}
 
 	if (difftime(time(NULL), srv_last_monitor_time) > 60) {
 		/* We referesh InnoDB Monitor values so that averages are
@@ -2274,6 +2281,7 @@ srv_master_do_active_tasks(void)
 {
 	ib_time_t	cur_time = ut_time();
 	ullint		counter_time = ut_time_us(NULL);
+	ulint		n_evicted = 0;
 
 	/* First do the tasks that we are suppose to do at each
 	invocation of this function. */
@@ -2302,7 +2310,7 @@ srv_master_do_active_tasks(void)
 	/* Do an ibuf merge */
 	srv_main_thread_op_info = "doing insert buffer merge";
 	counter_time = ut_time_us(NULL);
-	ibuf_contract_in_background(0, FALSE);
+	ibuf_merge_in_background(false);
 	MONITOR_INC_TIME_IN_MICRO_SECS(
 		MONITOR_SRV_IBUF_MERGE_MICROSECOND, counter_time);
 
@@ -2334,7 +2342,9 @@ srv_master_do_active_tasks(void)
 
 	if (cur_time % SRV_MASTER_DICT_LRU_INTERVAL == 0) {
 		srv_main_thread_op_info = "enforcing dict cache limit";
-		srv_master_evict_from_table_cache(50);
+		n_evicted = srv_master_evict_from_table_cache(50);
+		MONITOR_INC_VALUE(
+			MONITOR_SRV_DICT_LRU_EVICT_COUNT_ACTIVE, n_evicted);
 		MONITOR_INC_TIME_IN_MICRO_SECS(
 			MONITOR_SRV_DICT_LRU_MICROSECOND, counter_time);
 	}
@@ -2366,6 +2376,7 @@ srv_master_do_idle_tasks(void)
 /*==========================*/
 {
 	ullint	counter_time;
+	ulint	n_evicted = 0;
 
 	++srv_main_idle_loops;
 
@@ -2394,7 +2405,7 @@ srv_master_do_idle_tasks(void)
 	/* Do an ibuf merge */
 	counter_time = ut_time_us(NULL);
 	srv_main_thread_op_info = "doing insert buffer merge";
-	ibuf_contract_in_background(0, TRUE);
+	ibuf_merge_in_background(true);
 	MONITOR_INC_TIME_IN_MICRO_SECS(
 		MONITOR_SRV_IBUF_MERGE_MICROSECOND, counter_time);
 
@@ -2403,7 +2414,9 @@ srv_master_do_idle_tasks(void)
 	}
 
 	srv_main_thread_op_info = "enforcing dict cache limit";
-	srv_master_evict_from_table_cache(100);
+	n_evicted = srv_master_evict_from_table_cache(100);
+        MONITOR_INC_VALUE(
+                MONITOR_SRV_DICT_LRU_EVICT_COUNT_IDLE, n_evicted);
 	MONITOR_INC_TIME_IN_MICRO_SECS(
 		MONITOR_SRV_DICT_LRU_MICROSECOND, counter_time);
 
@@ -2470,7 +2483,7 @@ srv_master_do_shutdown_tasks(
 
 	/* Do an ibuf merge */
 	srv_main_thread_op_info = "doing insert buffer merge";
-	n_bytes_merged = ibuf_contract_in_background(0, TRUE);
+	n_bytes_merged = ibuf_merge_in_background(true);
 
 	/* Flush logs if needed */
 	srv_sync_log_buffer_in_background();
@@ -2510,7 +2523,7 @@ extern "C" UNIV_INTERN
 os_thread_ret_t
 DECLARE_THREAD(srv_master_thread)(
 /*==============================*/
-	void*	arg __attribute__((unused)))
+	void*	arg MY_ATTRIBUTE((unused)))
 			/*!< in: a dummy parameter required by
 			os_thread_create */
 {
@@ -2654,7 +2667,7 @@ extern "C" UNIV_INTERN
 os_thread_ret_t
 DECLARE_THREAD(srv_worker_thread)(
 /*==============================*/
-	void*	arg __attribute__((unused)))	/*!< in: a dummy parameter
+	void*	arg MY_ATTRIBUTE((unused)))	/*!< in: a dummy parameter
 						required by os_thread_create */
 {
 	srv_slot_t*	slot;
@@ -2787,13 +2800,8 @@ srv_do_purge(
 		}
 
 		n_pages_purged = trx_purge(
-			n_use_threads, srv_purge_batch_size, false);
-
-		if (!(count++ % TRX_SYS_N_RSEGS)) {
-			/* Force a truncate of the history list. */
-			n_pages_purged += trx_purge(
-				1, srv_purge_batch_size, true);
-		}
+			n_use_threads, srv_purge_batch_size,
+			(++count % TRX_SYS_N_RSEGS) == 0);
 
 		*n_total_purged += n_pages_purged;
 
@@ -2917,7 +2925,7 @@ extern "C" UNIV_INTERN
 os_thread_ret_t
 DECLARE_THREAD(srv_purge_coordinator_thread)(
 /*=========================================*/
-	void*	arg __attribute__((unused)))	/*!< in: a dummy parameter
+	void*	arg MY_ATTRIBUTE((unused)))	/*!< in: a dummy parameter
 						required by os_thread_create */
 {
 	srv_slot_t*	slot;
@@ -2986,8 +2994,17 @@ DECLARE_THREAD(srv_purge_coordinator_thread)(
 		n_pages_purged = trx_purge(1, srv_purge_batch_size, false);
 	}
 
-	/* Force a truncate of the history list. */
-	n_pages_purged = trx_purge(1, srv_purge_batch_size, true);
+	/* This trx_purge is called to remove any undo records (added by
+	background threads) after completion of the above loop. When
+	srv_fast_shutdown != 0, a large batch size can cause significant
+	delay in shutdown ,so reducing the batch size to magic number 20
+	(which was default in 5.5), which we hope will be sufficient to
+	remove all the undo records */
+	const	uint temp_batch_size = 20;
+
+	n_pages_purged = trx_purge(1, srv_purge_batch_size <= temp_batch_size
+				      ? srv_purge_batch_size : temp_batch_size,
+				   true);
 	ut_a(n_pages_purged == 0 || srv_fast_shutdown != 0);
 
 	/* The task queue should always be empty, independent of fast

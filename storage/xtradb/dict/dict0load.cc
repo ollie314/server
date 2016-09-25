@@ -1,6 +1,7 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2013, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2016, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -1153,11 +1154,14 @@ loop:
 					space_id, name);
 			}
 
-			/* We need to read page 0 to get (optional) IV
-			regardless if encryptions is turned on or not,
-			since if it's off we should decrypt a potentially
-			already encrypted table */
-			bool read_page_0 = true;
+			/* We could read page 0 to get (optional) IV
+			if encryption is turned on, if it's off
+			we will read the page 0 later and find out
+			if we should decrypt a potentially
+			already encrypted table
+			bool read_page_0 = srv_encrypt_tables; */
+
+			bool read_page_0 = false;
 
 			/* We set the 2nd param (fix_dict = true)
 			here because we already have an x-lock on
@@ -1168,7 +1172,7 @@ loop:
 			dberr_t	err = fil_open_single_table_tablespace(
 				read_page_0, srv_read_only_mode ? false : true,
 				space_id, dict_tf_to_fsp_flags(flags),
-				name, filepath);
+				name, filepath, NULL);
 
 			if (err != DB_SUCCESS) {
 				ib_logf(IB_LOG_LEVEL_ERROR,
@@ -1750,7 +1754,7 @@ err_len:
 		goto err_len;
 	}
 	type = mach_read_from_4(field);
-	if (type & (~0 << DICT_IT_BITS)) {
+	if (type & (~0U << DICT_IT_BITS)) {
 		return("unknown SYS_INDEXES.TYPE bits");
 	}
 
@@ -1790,7 +1794,7 @@ Loads definitions for table indexes. Adds them to the data dictionary
 cache.
 @return DB_SUCCESS if ok, DB_CORRUPTION if corruption of dictionary
 table or DB_UNSUPPORTED if table has unknown index type */
-static __attribute__((nonnull))
+static MY_ATTRIBUTE((nonnull))
 dberr_t
 dict_load_indexes(
 /*==============*/
@@ -2242,8 +2246,9 @@ dict_get_and_save_data_dir_path(
 	bool		dict_mutex_own)	/*!< in: true if dict_sys->mutex
 					is owned already */
 {
-	if (DICT_TF_HAS_DATA_DIR(table->flags)
-	    && (!table->data_dir_path)) {
+	bool is_temp = DICT_TF2_FLAG_IS_SET(table, DICT_TF2_TEMPORARY);
+
+	if (!is_temp && !table->data_dir_path && table->space) {
 		char*	path = fil_space_get_first_path(table->space);
 
 		if (!dict_mutex_own) {
@@ -2255,6 +2260,7 @@ dict_get_and_save_data_dir_path(
 		}
 
 		if (path) {
+			table->flags |= (1 << DICT_TF_POS_DATA_DIR);
 			dict_save_data_dir_path(table, path);
 			mem_free(path);
 		}
@@ -2395,16 +2401,14 @@ err_exit:
 			}
 
 			/* Use the remote filepath if needed. */
-			if (DICT_TF_HAS_DATA_DIR(table->flags)) {
-				/* This needs to be added to the table
-				from SYS_DATAFILES */
-				dict_get_and_save_data_dir_path(table, true);
+			/* This needs to be added to the table
+			from SYS_DATAFILES */
+			dict_get_and_save_data_dir_path(table, true);
 
-				if (table->data_dir_path) {
-					filepath = os_file_make_remote_pathname(
+			if (table->data_dir_path) {
+				filepath = os_file_make_remote_pathname(
 						table->data_dir_path,
 						table->name, "ibd");
-				}
 			}
 
 			/* Try to open the tablespace.  We set the
@@ -2413,7 +2417,7 @@ err_exit:
 			err = fil_open_single_table_tablespace(
 				true, false, table->space,
 				dict_tf_to_fsp_flags(table->flags),
-				name, filepath);
+				name, filepath, table);
 
 			if (err != DB_SUCCESS) {
 				/* We failed to find a sensible
@@ -2538,6 +2542,7 @@ func_exit:
 			/* the table->fts could be created in dict_load_column
 			when a user defined FTS_DOC_ID is present, but no
 			FTS */
+			fts_optimize_remove_table(table);
 			fts_free(table);
 		} else {
 			fts_optimize_add_table(table);
@@ -2603,14 +2608,13 @@ dict_load_table_on_id(
 	btr_pcur_open_on_user_rec(sys_table_ids, tuple, PAGE_CUR_GE,
 				  BTR_SEARCH_LEAF, &pcur, &mtr);
 
-check_rec:
 	rec = btr_pcur_get_rec(&pcur);
 
 	if (page_rec_is_user_rec(rec)) {
 		/*---------------------------------------------------*/
 		/* Now we have the record in the secondary index
 		containing the table ID and NAME */
-
+check_rec:
 		field = rec_get_nth_field_old(
 			rec, DICT_FLD__SYS_TABLE_IDS__ID, &len);
 		ut_ad(len == 8);
@@ -2620,12 +2624,14 @@ check_rec:
 			if (rec_get_deleted_flag(rec, 0)) {
 				/* Until purge has completed, there
 				may be delete-marked duplicate records
-				for the same SYS_TABLES.ID.
-				Due to Bug #60049, some delete-marked
-				records may survive the purge forever. */
-				if (btr_pcur_move_to_next(&pcur, &mtr)) {
+				for the same SYS_TABLES.ID, but different
+				SYS_TABLES.NAME. */
+				while (btr_pcur_move_to_next(&pcur, &mtr)) {
+					rec = btr_pcur_get_rec(&pcur);
 
-					goto check_rec;
+					if (page_rec_is_user_rec(rec)) {
+						goto check_rec;
+					}
 				}
 			} else {
 				/* Now we get the table name from the record */
@@ -2887,7 +2893,7 @@ dict_load_foreign_cols(
 /***********************************************************************//**
 Loads a foreign key constraint to the dictionary cache.
 @return	DB_SUCCESS or error code */
-static __attribute__((nonnull(1), warn_unused_result))
+static MY_ATTRIBUTE((nonnull(1), warn_unused_result))
 dberr_t
 dict_load_foreign(
 /*==============*/

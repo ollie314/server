@@ -325,6 +325,14 @@ static Sys_var_long Sys_pfs_digest_size(
        DEFAULT(-1),
        BLOCK_SIZE(1));
 
+static Sys_var_long Sys_pfs_max_digest_length(
+       "performance_schema_max_digest_length",
+       "Maximum length considered for digest text, when stored in performance_schema tables.",
+       PARSED_EARLY READ_ONLY GLOBAL_VAR(pfs_param.m_max_digest_length),
+       CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 1024 * 1024),
+       DEFAULT(1024),
+       BLOCK_SIZE(1));
+
 static Sys_var_long Sys_pfs_connect_attrs_size(
        "performance_schema_session_connect_attrs_size",
        "Size of session attribute string buffer per thread."
@@ -362,10 +370,10 @@ static Sys_var_mybool Sys_automatic_sp_privileges(
 
 static Sys_var_ulong Sys_back_log(
        "back_log", "The number of outstanding connection requests "
-       "MySQL can have. This comes into play when the main MySQL thread "
+       "MariaDB can have. This comes into play when the main MySQL thread "
        "gets very many connection requests in a very short time",
-       READ_ONLY GLOBAL_VAR(back_log), CMD_LINE(REQUIRED_ARG),
-       VALID_RANGE(1, 65535), DEFAULT(150), BLOCK_SIZE(1));
+       AUTO_SET READ_ONLY GLOBAL_VAR(back_log), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(0, 65535), DEFAULT(150), BLOCK_SIZE(1));
 
 static Sys_var_charptr Sys_basedir(
        "basedir", "Path to installation directory. All paths are "
@@ -533,6 +541,17 @@ static Sys_var_mybool Sys_binlog_direct(
        SESSION_VAR(binlog_direct_non_trans_update),
        CMD_LINE(OPT_ARG), DEFAULT(FALSE),
        NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(binlog_direct_check));
+
+
+static Sys_var_mybool Sys_explicit_defaults_for_timestamp(
+       "explicit_defaults_for_timestamp",
+       "This option causes CREATE TABLE to create all TIMESTAMP columns "
+       "as NULL with DEFAULT NULL attribute, Without this option, "
+       "TIMESTAMP columns are NOT NULL and have implicit DEFAULT clauses. "
+       "The old behavior is deprecated.",
+       READ_ONLY GLOBAL_VAR(opt_explicit_defaults_for_timestamp),
+       CMD_LINE(OPT_ARG), DEFAULT(FALSE), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
 
 static Sys_var_ulonglong Sys_bulk_insert_buff_size(
        "bulk_insert_buffer_size", "Size of tree cache used in bulk "
@@ -820,30 +839,26 @@ static Sys_var_ulong Sys_delayed_queue_size(
        VALID_RANGE(1, UINT_MAX), DEFAULT(DELAYED_QUEUE_SIZE), BLOCK_SIZE(1));
 
 #ifdef HAVE_EVENT_SCHEDULER
-static const char *event_scheduler_names[]= { "OFF", "ON", "DISABLED", NullS };
+static const char *event_scheduler_names[]= { "OFF", "ON", "DISABLED",
+                                              "ORIGINAL", NullS };
 static bool event_scheduler_check(sys_var *self, THD *thd, set_var *var)
 {
-  /* DISABLED is only accepted on the command line */
-  if (var->save_result.ulonglong_value == Events::EVENTS_DISABLED)
-    return true;
-  /*
-    If the scheduler was disabled because there are no/bad
-    system tables, produce a more meaningful error message
-    than ER_OPTION_PREVENTS_STATEMENT
-  */
-  if (Events::check_if_system_tables_error())
-    return true;
   if (Events::opt_event_scheduler == Events::EVENTS_DISABLED)
   {
     my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0),
              "--event-scheduler=DISABLED or --skip-grant-tables");
     return true;
   }
+  /* DISABLED is only accepted on the command line */
+  if (var->save_result.ulonglong_value == Events::EVENTS_DISABLED)
+    return true;
   return false;
 }
+
 static bool event_scheduler_update(sys_var *self, THD *thd, enum_var_type type)
 {
   int err_no= 0;
+  bool ret;
   uint opt_event_scheduler_value= Events::opt_event_scheduler;
   mysql_mutex_unlock(&LOCK_global_system_variables);
   /*
@@ -862,9 +877,25 @@ static bool event_scheduler_update(sys_var *self, THD *thd, enum_var_type type)
     rare and it's difficult to avoid it without opening up possibilities
     for deadlocks. See bug#51160.
   */
-  bool ret= opt_event_scheduler_value == Events::EVENTS_ON
-            ? Events::start(&err_no)
-            : Events::stop();
+
+  /* EVENTS_ORIGINAL means we should revert back to the startup state */
+  if (opt_event_scheduler_value == Events::EVENTS_ORIGINAL)
+  {
+    opt_event_scheduler_value= Events::opt_event_scheduler=
+      Events::startup_state;
+  }
+ 
+  /*
+    If the scheduler was not properly inited (because of wrong system tables),
+    try to init it again. This is needed for mysql_upgrade to work properly if
+    the event tables where upgraded.
+  */
+  if (!Events::inited && (Events::init(thd, 0) || !Events::inited))
+    ret= 1;
+  else
+    ret= opt_event_scheduler_value == Events::EVENTS_ON ?
+      Events::start(&err_no) :
+      Events::stop();
   mysql_mutex_lock(&LOCK_global_system_variables);
   if (ret)
   {
@@ -1027,7 +1058,7 @@ static Sys_var_ulonglong Sys_join_buffer_size(
        "join_buffer_size",
        "The size of the buffer that is used for joins",
        SESSION_VAR(join_buff_size), CMD_LINE(REQUIRED_ARG),
-       VALID_RANGE(128, SIZE_T_MAX), DEFAULT(128*1024), BLOCK_SIZE(128));
+       VALID_RANGE(128, SIZE_T_MAX), DEFAULT(256*1024), BLOCK_SIZE(128));
 
 static Sys_var_keycache Sys_key_buffer_size(
        "key_buffer_size", "The size of the buffer used for "
@@ -1124,7 +1155,6 @@ static Sys_var_mybool Sys_log_bin(
        "log_bin", "Whether the binary log is enabled",
        READ_ONLY GLOBAL_VAR(opt_bin_log), NO_CMD_LINE, DEFAULT(FALSE));
 
-
 static Sys_var_mybool Sys_trust_function_creators(
        "log_bin_trust_function_creators",
        "If set to FALSE (the default), then when --log-bin is used, creation "
@@ -1151,6 +1181,19 @@ static Sys_var_mybool Sys_log_queries_not_using_indexes(
        "Log queries that are executed without benefit of any index to the "
        "slow log if it is open",
        GLOBAL_VAR(opt_log_queries_not_using_indexes),
+       CMD_LINE(OPT_ARG), DEFAULT(FALSE));
+
+static Sys_var_mybool Sys_log_slow_admin_statements(
+       "log_slow_admin_statements",
+       "Log slow OPTIMIZE, ANALYZE, ALTER and other administrative statements to "
+       "the slow log if it is open.",
+       GLOBAL_VAR(opt_log_slow_admin_statements),
+       CMD_LINE(OPT_ARG), DEFAULT(FALSE));
+
+static Sys_var_mybool Sys_log_slow_slave_statements(
+       "log_slow_slave_statements",
+       "Log slow statements executed by slave thread to the slow log if it is open.",
+       GLOBAL_VAR(opt_log_slow_slave_statements),
        CMD_LINE(OPT_ARG), DEFAULT(FALSE));
 
 static Sys_var_ulong Sys_log_warnings(
@@ -1279,7 +1322,7 @@ static Sys_var_ulong Sys_max_allowed_packet(
        "max_allowed_packet",
        "Max packet length to send to or receive from the server",
        SESSION_VAR(max_allowed_packet), CMD_LINE(REQUIRED_ARG),
-       VALID_RANGE(1024, 1024*1024*1024), DEFAULT(1024*1024),
+       VALID_RANGE(1024, 1024*1024*1024), DEFAULT(4*1024*1024),
        BLOCK_SIZE(1024), NO_MUTEX_GUARD, NOT_IN_BINLOG,
        ON_CHECK(check_max_allowed_packet));
 
@@ -1349,7 +1392,7 @@ static Sys_var_ulong Sys_max_connect_errors(
 
 static Sys_var_uint Sys_max_digest_length(
        "max_digest_length", "Maximum length considered for digest text.",
-       PARSED_EARLY READ_ONLY GLOBAL_VAR(max_digest_length),
+       READ_ONLY GLOBAL_VAR(max_digest_length),
        CMD_LINE(REQUIRED_ARG),
        VALID_RANGE(0, 1024 * 1024), DEFAULT(1024), BLOCK_SIZE(1));
 
@@ -1554,7 +1597,8 @@ Sys_var_gtid_slave_pos::do_check(THD *thd, set_var *var)
   }
 
   mysql_mutex_lock(&LOCK_active_mi);
-  running= master_info_index->give_error_if_slave_running();
+  running= (!master_info_index ||
+            master_info_index->give_error_if_slave_running());
   mysql_mutex_unlock(&LOCK_active_mi);
   if (running)
     return true;
@@ -1594,7 +1638,7 @@ Sys_var_gtid_slave_pos::global_update(THD *thd, set_var *var)
 
   mysql_mutex_unlock(&LOCK_global_system_variables);
   mysql_mutex_lock(&LOCK_active_mi);
-  if (master_info_index->give_error_if_slave_running())
+  if (!master_info_index || master_info_index->give_error_if_slave_running())
     err= true;
   else
     err= rpl_gtid_pos_update(thd, var->save_result.string_value.str,
@@ -1620,7 +1664,7 @@ Sys_var_gtid_slave_pos::global_value_ptr(THD *thd, const LEX_STRING *base)
     But if the table is not loaded (eg. missing mysql_upgrade_db or some such),
     then the slave state must be empty anyway.
   */
-  if ((rpl_global_gtid_slave_state.loaded &&
+  if ((rpl_global_gtid_slave_state->loaded &&
        rpl_append_gtid_state(&str, false)) ||
       !(p= thd->strmake(str.ptr(), str.length())))
   {
@@ -1783,7 +1827,8 @@ check_slave_parallel_threads(sys_var *self, THD *thd, set_var *var)
   bool running;
 
   mysql_mutex_lock(&LOCK_active_mi);
-  running= master_info_index->give_error_if_slave_running();
+  running= (!master_info_index ||
+            master_info_index->give_error_if_slave_running());
   mysql_mutex_unlock(&LOCK_active_mi);
   if (running)
     return true;
@@ -1798,7 +1843,8 @@ fix_slave_parallel_threads(sys_var *self, THD *thd, enum_var_type type)
 
   mysql_mutex_unlock(&LOCK_global_system_variables);
   mysql_mutex_lock(&LOCK_active_mi);
-  err= master_info_index->give_error_if_slave_running();
+  err= (!master_info_index ||
+        master_info_index->give_error_if_slave_running());
   mysql_mutex_unlock(&LOCK_active_mi);
   mysql_mutex_lock(&LOCK_global_system_variables);
 
@@ -1825,7 +1871,8 @@ check_slave_domain_parallel_threads(sys_var *self, THD *thd, set_var *var)
   bool running;
 
   mysql_mutex_lock(&LOCK_active_mi);
-  running= master_info_index->give_error_if_slave_running();
+  running= (!master_info_index ||
+            master_info_index->give_error_if_slave_running());
   mysql_mutex_unlock(&LOCK_active_mi);
   if (running)
     return true;
@@ -1840,7 +1887,8 @@ fix_slave_domain_parallel_threads(sys_var *self, THD *thd, enum_var_type type)
 
   mysql_mutex_unlock(&LOCK_global_system_variables);
   mysql_mutex_lock(&LOCK_active_mi);
-  running= master_info_index->give_error_if_slave_running();
+  running= (!master_info_index ||
+            master_info_index->give_error_if_slave_running());
   mysql_mutex_unlock(&LOCK_active_mi);
   mysql_mutex_lock(&LOCK_global_system_variables);
 
@@ -1990,7 +2038,8 @@ check_gtid_ignore_duplicates(sys_var *self, THD *thd, set_var *var)
   bool running;
 
   mysql_mutex_lock(&LOCK_active_mi);
-  running= master_info_index->give_error_if_slave_running();
+  running= (!master_info_index ||
+            master_info_index->give_error_if_slave_running());
   mysql_mutex_unlock(&LOCK_active_mi);
   if (running)
     return true;
@@ -2005,7 +2054,8 @@ fix_gtid_ignore_duplicates(sys_var *self, THD *thd, enum_var_type type)
 
   mysql_mutex_unlock(&LOCK_global_system_variables);
   mysql_mutex_lock(&LOCK_active_mi);
-  running= master_info_index->give_error_if_slave_running();
+  running= (!master_info_index ||
+            master_info_index->give_error_if_slave_running());
   mysql_mutex_unlock(&LOCK_active_mi);
   mysql_mutex_lock(&LOCK_global_system_variables);
 
@@ -2348,7 +2398,9 @@ export const char *optimizer_switch_names[]=
   "table_elimination",
   "extended_keys",
   "exists_to_in",
-  "default", NullS
+  "orderby_uses_equalities",
+  "default", 
+  NullS
 };
 static bool fix_optimizer_switch(sys_var *self, THD *thd,
                                  enum_var_type type)
@@ -2684,17 +2736,6 @@ static Sys_var_enum Sys_thread_handling(
  );
 
 #ifdef HAVE_QUERY_CACHE
-static bool check_query_cache_size(sys_var *self, THD *thd, set_var *var)
-{
-  if (global_system_variables.query_cache_type == 0 &&
-      var->value && var->value->val_int() != 0)
-  {
-    my_error(ER_QUERY_CACHE_DISABLED, MYF(0));
-    return true;
-  }
-
-  return false;
-}
 static bool fix_query_cache_size(sys_var *self, THD *thd, enum_var_type type)
 {
   ulong new_cache_size= query_cache.resize(query_cache_size);
@@ -2708,8 +2749,10 @@ static bool fix_query_cache_size(sys_var *self, THD *thd, enum_var_type type)
                         query_cache_size, new_cache_size);
 
   query_cache_size= new_cache_size;
+
   return false;
 }
+
 static bool fix_query_cache_limit(sys_var *self, THD *thd, enum_var_type type)
 {
   query_cache.result_size_limit(query_cache_limit);
@@ -2719,8 +2762,8 @@ static Sys_var_ulonglong Sys_query_cache_size(
        "query_cache_size",
        "The memory allocated to store results from old queries",
        GLOBAL_VAR(query_cache_size), CMD_LINE(REQUIRED_ARG),
-       VALID_RANGE(0, ULONG_MAX), DEFAULT(0), BLOCK_SIZE(1024),
-       NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(check_query_cache_size),
+       VALID_RANGE(0, ULONG_MAX), DEFAULT(1024*1024), BLOCK_SIZE(1024),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG, NULL,
        ON_UPDATE(fix_query_cache_size));
 
 static Sys_var_ulong Sys_query_cache_limit(
@@ -2746,6 +2789,7 @@ static Sys_var_ulong Sys_query_cache_min_res_unit(
        ON_UPDATE(fix_qcache_min_res_unit));
 
 static const char *query_cache_type_names[]= { "OFF", "ON", "DEMAND", 0 };
+
 static bool check_query_cache_type(sys_var *self, THD *thd, set_var *var)
 {
   if (query_cache.is_disable_in_progress())
@@ -2753,16 +2797,22 @@ static bool check_query_cache_type(sys_var *self, THD *thd, set_var *var)
     my_error(ER_QUERY_CACHE_IS_DISABLED, MYF(0));
     return true;
   }
-  if (var->type != OPT_GLOBAL &&
-      global_system_variables.query_cache_type == 0 &&
-      var->value->val_int() != 0)
-  {
-    my_error(ER_QUERY_CACHE_IS_GLOBALY_DISABLED, MYF(0));
-    return true;
-  }
 
+  if (var->type != OPT_GLOBAL && global_system_variables.query_cache_type == 0)
+  {
+    if (var->value)
+    {
+      if (var->save_result.ulonglong_value != 0)
+      {
+        my_error(ER_QUERY_CACHE_IS_GLOBALY_DISABLED, MYF(0));
+        return true;
+      }
+    }
+  }
   return false;
 }
+
+
 static bool fix_query_cache_type(sys_var *self, THD *thd, enum_var_type type)
 {
   if (type != OPT_GLOBAL)
@@ -2786,7 +2836,7 @@ static Sys_var_enum Sys_query_cache_type(
        "except SELECT SQL_NO_CACHE ... queries. DEMAND = Cache only "
        "SELECT SQL_CACHE ... queries",
        NO_SET_STMT SESSION_VAR(query_cache_type), CMD_LINE(REQUIRED_ARG),
-       query_cache_type_names, DEFAULT(1), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+       query_cache_type_names, DEFAULT(0), NO_MUTEX_GUARD, NOT_IN_BINLOG,
        ON_CHECK(check_query_cache_type),
        ON_UPDATE(fix_query_cache_type));
 
@@ -2802,7 +2852,7 @@ static Sys_var_mybool Sys_secure_auth(
        "Disallow authentication for accounts that have old (pre-4.1) "
        "passwords",
        GLOBAL_VAR(opt_secure_auth), CMD_LINE(OPT_ARG),
-       DEFAULT(FALSE));
+       DEFAULT(TRUE));
 
 static Sys_var_charptr Sys_secure_file_priv(
        "secure_file_priv",
@@ -2919,7 +2969,7 @@ Sys_var_replicate_events_marked_for_skip::global_update(THD *thd, set_var *var)
 
   mysql_mutex_unlock(&LOCK_global_system_variables);
   mysql_mutex_lock(&LOCK_active_mi);
-  if (!master_info_index->give_error_if_slave_running())
+  if (master_info_index && !master_info_index->give_error_if_slave_running())
     result= Sys_var_enum::global_update(thd, var);
   mysql_mutex_unlock(&LOCK_active_mi);
   mysql_mutex_lock(&LOCK_global_system_variables);
@@ -3055,7 +3105,10 @@ static Sys_var_set Sys_sql_mode(
        "sql_mode",
        "Sets the sql mode",
        SESSION_VAR(sql_mode), CMD_LINE(REQUIRED_ARG),
-       sql_mode_names, DEFAULT(0), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+       sql_mode_names,
+       DEFAULT(MODE_NO_ENGINE_SUBSTITUTION |
+               MODE_NO_AUTO_CREATE_USER),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG,
        ON_CHECK(check_sql_mode), ON_UPDATE(fix_sql_mode));
 
 static const char *old_mode_names[]=
@@ -3369,7 +3422,7 @@ static char *server_version_compile_machine_ptr;
 static Sys_var_charptr Sys_version_compile_machine(
        "version_compile_machine", "version_compile_machine",
        READ_ONLY GLOBAL_VAR(server_version_compile_machine_ptr),
-       CMD_LINE_HELP_ONLY, IN_SYSTEM_CHARSET, DEFAULT(MACHINE_TYPE));
+       CMD_LINE_HELP_ONLY, IN_SYSTEM_CHARSET, DEFAULT(DEFAULT_MACHINE));
 
 static char *server_version_compile_os_ptr;
 static Sys_var_charptr Sys_version_compile_os(
@@ -3941,14 +3994,16 @@ static bool check_log_path(sys_var *self, THD *thd, set_var *var)
   if (!var->save_result.string_value.str)
     return true;
 
-  if (var->save_result.string_value.length > FN_REFLEN)
+  LEX_STRING *val= &var->save_result.string_value;
+
+  if (val->length > FN_REFLEN)
   { // path is too long
     my_error(ER_PATH_LENGTH, MYF(0), self->name.str);
     return true;
   }
 
   char path[FN_REFLEN];
-  size_t path_length= unpack_filename(path, var->save_result.string_value.str);
+  size_t path_length= unpack_filename(path, val->str);
 
   if (!path_length)
     return true;
@@ -3961,6 +4016,17 @@ static bool check_log_path(sys_var *self, THD *thd, set_var *var)
      return true;
   }
 
+  static const LEX_CSTRING my_cnf= { STRING_WITH_LEN("my.cnf") };
+  static const LEX_CSTRING my_ini= { STRING_WITH_LEN("my.ini") };
+  if (path_length >= my_cnf.length)
+  {
+    if (strcasecmp(path + path_length - my_cnf.length, my_cnf.str) == 0)
+      return true; // log file name ends with "my.cnf"
+    DBUG_ASSERT(my_cnf.length == my_ini.length);
+    if (strcasecmp(path + path_length - my_ini.length, my_ini.str) == 0)
+      return true; // log file name ends with "my.ini"
+  }
+
   MY_STAT f_stat;
 
   if (my_stat(path, &f_stat, MYF(0)))
@@ -3970,9 +4036,9 @@ static bool check_log_path(sys_var *self, THD *thd, set_var *var)
     return false;
   }
 
-  (void) dirname_part(path, var->save_result.string_value.str, &path_length);
+  (void) dirname_part(path, val->str, &path_length);
 
-  if (var->save_result.string_value.length - path_length >= FN_LEN)
+  if (val->length - path_length >= FN_LEN)
   { // filename is too long
       my_error(ER_PATH_LENGTH, MYF(0), self->name.str);
       return true;
@@ -4458,6 +4524,28 @@ static bool update_slave_skip_counter(sys_var *self, THD *thd, Master_info *mi)
              mi->connection_name.str);
     return true;
   }
+  if (mi->using_gtid != Master_info::USE_GTID_NO && mi->using_parallel())
+  {
+    ulong domain_count;
+    mysql_mutex_lock(&rpl_global_gtid_slave_state->LOCK_slave_state);
+    domain_count= rpl_global_gtid_slave_state->count();
+    mysql_mutex_unlock(&rpl_global_gtid_slave_state->LOCK_slave_state);
+    if (domain_count > 1)
+    {
+      /*
+        With domain-based parallel replication, the slave position is
+        multi-dimensional, so the relay log position is not very meaningful.
+        It might not even correspond to the next GTID to execute in _any_
+        domain (the case after error stop). So slave_skip_counter will most
+        likely not do what the user intends. Instead give an error, with a
+        suggestion to instead set @@gtid_slave_pos past the point of error;
+        this works reliably also in the case of multiple domains.
+      */
+      my_error(ER_SLAVE_SKIP_NOT_IN_GTID, MYF(0));
+      return true;
+    }
+  }
+
   /* The value was stored temporarily in thd */
   mi->rli.slave_skip_counter= thd->variables.slave_skip_counter;
   return false;
@@ -4500,16 +4588,16 @@ static Sys_var_ulonglong Sys_relay_log_space_limit(
 
 static Sys_var_uint Sys_sync_relaylog_period(
        "sync_relay_log", "Synchronously flush relay log to disk after "
-       "every #th event. Use 0 (default) to disable synchronous flushing",
+       "every #th event. Use 0 to disable synchronous flushing",
        GLOBAL_VAR(sync_relaylog_period), CMD_LINE(REQUIRED_ARG),
-       VALID_RANGE(0, UINT_MAX), DEFAULT(0), BLOCK_SIZE(1));
+       VALID_RANGE(0, UINT_MAX), DEFAULT(10000), BLOCK_SIZE(1));
 
 static Sys_var_uint Sys_sync_relayloginfo_period(
        "sync_relay_log_info", "Synchronously flush relay log info "
-       "to disk after every #th transaction. Use 0 (default) to disable "
+       "to disk after every #th transaction. Use 0 to disable "
        "synchronous flushing",
        GLOBAL_VAR(sync_relayloginfo_period), CMD_LINE(REQUIRED_ARG),
-       VALID_RANGE(0, UINT_MAX), DEFAULT(0), BLOCK_SIZE(1));
+       VALID_RANGE(0, UINT_MAX), DEFAULT(10000), BLOCK_SIZE(1));
 #endif
 
 static Sys_var_uint Sys_sync_binlog_period(
@@ -4520,9 +4608,9 @@ static Sys_var_uint Sys_sync_binlog_period(
 
 static Sys_var_uint Sys_sync_masterinfo_period(
        "sync_master_info", "Synchronously flush master info to disk "
-       "after every #th event. Use 0 (default) to disable synchronous flushing",
+       "after every #th event. Use 0 to disable synchronous flushing",
        GLOBAL_VAR(sync_masterinfo_period), CMD_LINE(REQUIRED_ARG),
-       VALID_RANGE(0, UINT_MAX), DEFAULT(0), BLOCK_SIZE(1));
+       VALID_RANGE(0, UINT_MAX), DEFAULT(10000), BLOCK_SIZE(1));
 
 #ifdef HAVE_REPLICATION
 static Sys_var_ulong Sys_slave_trans_retries(
@@ -4662,7 +4750,7 @@ static Sys_var_charptr Sys_wsrep_cluster_address (
 static Sys_var_charptr Sys_wsrep_node_name (
        "wsrep_node_name", "Node name",
        PREALLOCATED GLOBAL_VAR(wsrep_node_name), CMD_LINE(REQUIRED_ARG),
-       IN_SYSTEM_CHARSET, DEFAULT(""), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+       IN_SYSTEM_CHARSET, DEFAULT(glob_hostname), NO_MUTEX_GUARD, NOT_IN_BINLOG,
        wsrep_node_name_check, wsrep_node_name_update);
 
 static Sys_var_charptr Sys_wsrep_node_address (
@@ -4714,9 +4802,10 @@ static Sys_var_mybool Sys_wsrep_auto_increment_control(
        CMD_LINE(OPT_ARG), DEFAULT(TRUE));
 
 static Sys_var_mybool Sys_wsrep_drupal_282555_workaround(
-       "wsrep_drupal_282555_workaround", "To use a workaround for"
-       "bad autoincrement value", 
-       GLOBAL_VAR(wsrep_drupal_282555_workaround), 
+       "wsrep_drupal_282555_workaround", "Enable a workaround to handle the "
+       "cases where inserting a DEFAULT value into an auto-increment column "
+       "could fail with duplicate key error",
+       GLOBAL_VAR(wsrep_drupal_282555_workaround),
        CMD_LINE(OPT_ARG), DEFAULT(FALSE));
 
 static Sys_var_charptr sys_wsrep_sst_method(
@@ -4775,13 +4864,14 @@ static Sys_var_charptr Sys_wsrep_start_position (
 static Sys_var_ulong Sys_wsrep_max_ws_size (
        "wsrep_max_ws_size", "Max write set size (bytes)",
        GLOBAL_VAR(wsrep_max_ws_size), CMD_LINE(REQUIRED_ARG),
-       /* Upper limit is 65K short of 4G to avoid overlows on 32-bit systems */
-       VALID_RANGE(1024, WSREP_MAX_WS_SIZE), DEFAULT(1073741824UL), BLOCK_SIZE(1));
+       VALID_RANGE(1024, WSREP_MAX_WS_SIZE), DEFAULT(WSREP_MAX_WS_SIZE),
+       BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+       ON_CHECK(wsrep_max_ws_size_check), ON_UPDATE(wsrep_max_ws_size_update));
 
 static Sys_var_ulong Sys_wsrep_max_ws_rows (
        "wsrep_max_ws_rows", "Max number of rows in write set",
        GLOBAL_VAR(wsrep_max_ws_rows), CMD_LINE(REQUIRED_ARG),
-       VALID_RANGE(1, 1048576), DEFAULT(131072), BLOCK_SIZE(1));
+       VALID_RANGE(0, 1048576), DEFAULT(0), BLOCK_SIZE(1));
 
 static Sys_var_charptr Sys_wsrep_notify_cmd(
        "wsrep_notify_cmd", "",
@@ -4804,7 +4894,8 @@ static bool fix_wsrep_causal_reads(sys_var *self, THD* thd, enum_var_type var_ty
 static Sys_var_mybool Sys_wsrep_causal_reads(
        "wsrep_causal_reads", "Setting this variable is equivalent "
        "to setting wsrep_sync_wait READ flag",
-       SESSION_VAR(wsrep_causal_reads), CMD_LINE(OPT_ARG), DEFAULT(FALSE),
+       SESSION_VAR(wsrep_causal_reads),
+       CMD_LINE(OPT_ARG, OPT_WSREP_CAUSAL_READS), DEFAULT(FALSE),
        NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0),
        ON_UPDATE(fix_wsrep_causal_reads),
        DEPRECATED("'@@wsrep_sync_wait=1'"));
@@ -4814,7 +4905,7 @@ static Sys_var_uint Sys_wsrep_sync_wait(
        "an operation of the type specified by bitmask: 1 - READ(includes "
        "SELECT, SHOW and BEGIN/START TRANSACTION); 2 - UPDATE and DELETE; 4 - "
        "INSERT and REPLACE",
-       SESSION_VAR(wsrep_sync_wait), CMD_LINE(OPT_ARG),
+       SESSION_VAR(wsrep_sync_wait), CMD_LINE(OPT_ARG, OPT_WSREP_SYNC_WAIT),
        VALID_RANGE(WSREP_SYNC_WAIT_NONE, WSREP_SYNC_WAIT_MAX),
        DEFAULT(WSREP_SYNC_WAIT_NONE), BLOCK_SIZE(1),
        NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0),
@@ -4922,7 +5013,7 @@ static bool fix_host_cache_size(sys_var *, THD *, enum_var_type)
 static Sys_var_ulong Sys_host_cache_size(
        "host_cache_size",
        "How many host names should be cached to avoid resolving.",
-       GLOBAL_VAR(host_cache_size),
+       AUTO_SET GLOBAL_VAR(host_cache_size),
        CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 65536),
        DEFAULT(HOST_CACHE_SIZE),
        BLOCK_SIZE(1),
@@ -4978,14 +5069,6 @@ static Sys_var_ulong Sys_deadlock_timeout_depth_long(
        SESSION_VAR(wt_timeout_long), CMD_LINE(REQUIRED_ARG),
        VALID_RANGE(0, UINT_MAX), DEFAULT(50000000), BLOCK_SIZE(1));
 
-#ifndef DBUG_OFF
-static Sys_var_ulong Sys_debug_crc_break(
-       "debug_crc_break",
-       "Call my_debug_put_break_here() if crc matches this number (for debug)",
-       GLOBAL_VAR(my_crc_dbug_check), CMD_LINE(REQUIRED_ARG),
-       VALID_RANGE(0, ULONG_MAX), DEFAULT(0), BLOCK_SIZE(1));
-#endif
-
 static Sys_var_uint Sys_extra_port(
        "extra_port",
        "Extra port number to use for tcp connections in a "
@@ -5024,7 +5107,7 @@ static Sys_var_set Sys_log_slow_filter(
        "Log only certain types of queries",
        SESSION_VAR(log_slow_filter), CMD_LINE(REQUIRED_ARG),
        log_slow_filter_names,
-       DEFAULT(MAX_SET(array_elements(log_slow_filter_names)-1)));
+       DEFAULT(my_set_bits(array_elements(log_slow_filter_names)-1)));
 
 static const char *default_regex_flags_names[]= 
 {
@@ -5213,7 +5296,12 @@ static Sys_var_mybool Sys_encrypt_tmp_files(
        "encrypt_tmp_files",
        "Encrypt temporary files (created for filesort, binary log cache, etc)",
        READ_ONLY GLOBAL_VAR(encrypt_tmp_files),
-       CMD_LINE(OPT_ARG), DEFAULT(TRUE));
+       CMD_LINE(OPT_ARG), DEFAULT(FALSE));
+
+static Sys_var_mybool Sys_binlog_encryption(
+       "encrypt_binlog", "Encrypt binary logs (including relay logs)",
+       READ_ONLY GLOBAL_VAR(encrypt_binlog), CMD_LINE(OPT_ARG),
+       DEFAULT(FALSE));
 
 static const char *binlog_row_image_names[]= {"MINIMAL", "NOBLOB", "FULL", NullS};
 static Sys_var_enum Sys_binlog_row_image(

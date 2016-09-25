@@ -1,4 +1,5 @@
-/* Copyright (c) 2010, 2011, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2010, 2016, Oracle and/or its affiliates.
+   Copyright (c) 2011, 2016, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -28,7 +29,7 @@
 #include "rpl_mi.h"      // Master_info::data_lock
 #include "sql_show.h"
 #include "debug_sync.h"
-#include "rpl_mi.h"
+#include "des_key_file.h"
 
 static void disable_checkpoints(THD *thd);
 
@@ -94,6 +95,7 @@ bool reload_acl_and_cache(THD *thd, unsigned long long options,
         my_error(ER_UNKNOWN_ERROR, MYF(0));
       }
     }
+    opt_noacl= 0;
 
     if (tmp_thd)
     {
@@ -153,6 +155,12 @@ bool reload_acl_and_cache(THD *thd, unsigned long long options,
     {
       if (mysql_bin_log.rotate_and_purge(true))
         *write_to_binlog= -1;
+
+      if (WSREP_ON)
+      {
+        /* Wait for last binlog checkpoint event to be logged. */
+        mysql_bin_log.wait_for_last_checkpoint_event();
+      }
     }
   }
   if (options & REFRESH_RELAY_LOG)
@@ -309,6 +317,16 @@ bool reload_acl_and_cache(THD *thd, unsigned long long options,
         }
       }
 
+#ifdef WITH_WSREP
+      if (thd && thd->wsrep_applier)
+      {
+        /*
+          In case of applier thread, do not wait for table share(s) to be
+          removed from table definition cache.
+        */
+        options|= REFRESH_FAST;
+      }
+#endif
       if (close_cached_tables(thd, tables,
                               ((options & REFRESH_FAST) ?  FALSE : TRUE),
                               (thd ? thd->variables.lock_wait_timeout :
@@ -341,7 +359,7 @@ bool reload_acl_and_cache(THD *thd, unsigned long long options,
     }
   }
 #endif
-#ifdef OPENSSL
+#ifdef HAVE_OPENSSL
    if (options & REFRESH_DES_KEY_FILE)
    {
      if (des_key_file && load_des_key_file(des_key_file))

@@ -51,12 +51,6 @@ if(MSVC)
   endif()
 endif()
 
-if(MRN_BUNDLED)
-  if(WITHOUT_MROONGA OR WITHOUT_MROONGA_STORAGE_ENGINE)
-    return()
-  endif()
-endif()
-
 set(MRN_BUNDLED_GROONGA_RELATIVE_DIR "vendor/groonga")
 set(MRN_BUNDLED_GROONGA_DIR
   "${CMAKE_CURRENT_SOURCE_DIR}/${MRN_BUNDLED_GROONGA_RELATIVE_DIR}")
@@ -84,6 +78,61 @@ file(READ ${MRN_SOURCE_DIR}/version_minor  MRN_VERSION_MINOR)
 file(READ ${MRN_SOURCE_DIR}/version_micro  MRN_VERSION_MICRO)
 file(READ ${MRN_SOURCE_DIR}/version_in_hex MRN_VERSION_IN_HEX)
 file(READ ${MRN_SOURCE_DIR}/plugin_version MRN_PLUGIN_VERSION)
+
+set(MRN_PACKAGE_STRING "${PROJECT_NAME} ${MRN_VERSION}")
+
+include(CheckCCompilerFlag)
+include(CheckCXXCompilerFlag)
+include(${MRN_SOURCE_DIR}/build/cmake_modules/ReadFileList.cmake)
+
+set(MRN_C_COMPILE_FLAGS "")
+set(MRN_CXX_COMPILE_FLAGS "")
+
+if(MRN_BUNDLED)
+  set(MRN_RELATIVE_DIR_PREFIX "${MRN_SOURCE_DIR}/")
+else()
+  set(MRN_RELATIVE_DIR_PREFIX "")
+endif()
+
+read_file_list(${CMAKE_CURRENT_SOURCE_DIR}/sources.am MRN_SOURCES)
+read_file_list(${CMAKE_CURRENT_SOURCE_DIR}/lib/libmrn_no_mysql_sources.am
+  LIBMRN_NO_MYSQL_SOURCES)
+string(REGEX REPLACE "([^;]+)" "${MRN_RELATIVE_DIR_PREFIX}lib/\\1"
+  LIBMRN_NO_MYSQL_SOURCES "${LIBMRN_NO_MYSQL_SOURCES}")
+read_file_list(${CMAKE_CURRENT_SOURCE_DIR}/lib/libmrn_need_mysql_sources.am
+  LIBMRN_NEED_MYSQL_SOURCES)
+string(REGEX REPLACE "([^;]+)" "${MRN_RELATIVE_DIR_PREFIX}lib/\\1"
+  LIBMRN_NEED_MYSQL_SOURCES "${LIBMRN_NEED_MYSQL_SOURCES}")
+read_file_list(${CMAKE_CURRENT_SOURCE_DIR}/udf/sources.am MRN_UDF_SOURCES)
+string(REGEX REPLACE "([^;]+)" "${MRN_RELATIVE_DIR_PREFIX}udf/\\1"
+  MRN_UDF_SOURCES "${MRN_UDF_SOURCES}")
+
+set(MRN_ALL_SOURCES
+  ${MRN_SOURCES}
+  ${MRN_UDF_SOURCES}
+  ${LIBMRN_NO_MYSQL_SOURCES}
+  ${LIBMRN_NEED_MYSQL_SOURCES})
+
+if(MRN_BUNDLED)
+  mysql_add_plugin(mroonga ${MRN_ALL_SOURCES} STORAGE_ENGINE MODULE_ONLY)
+  if(NOT TARGET mroonga)
+    return()
+  endif()
+
+  set(MYSQL_SOURCE_DIR ${CMAKE_SOURCE_DIR})
+  set(MYSQL_BUILD_DIR ${MYSQL_SOURCE_DIR})
+  set(MYSQL_CONFIG ${CMAKE_SOURCE_DIR}/scripts/mysql_config)
+else()
+  set(MYSQL_SOURCE_DIR "/PATH/TO/MYSQL/SOURCE/DIRECTORY/"
+    CACHE PATH "MySQL source directory")
+  if(NOT EXISTS ${MYSQL_SOURCE_DIR})
+    message(FATAL_ERROR
+      "MySQL source directory (MYSQL_SOURCE_DIR) doesn't exist: <${MYSQL_SOURCE_DIR}>")
+  endif()
+  set(MYSQL_BUILD_DIR ${MYSQL_SOURCE_DIR} CACHE PATH "MySQL build directory")
+  set(MYSQL_CONFIG "mysql_config" CACHE PATH "mysql-config command path")
+endif()
+find_path(MYSQL_CONFIG "${MYSQL_CONFIG}")
 
 if(MRN_GROONGA_BUNDLED)
   option(MRN_GROONGA_EMBED
@@ -122,75 +171,6 @@ else()
     "${REQUIRED_GROONGA_NORMALIZER_MYSQL_VERSION}"
     REQUIRED_GROONGA_NORMALIZER_MYSQL_VERSION)
 endif()
-
-set(MRN_PACKAGE_STRING "${PROJECT_NAME} ${MRN_VERSION}")
-
-include(CheckCCompilerFlag)
-include(CheckCXXCompilerFlag)
-include(${MRN_SOURCE_DIR}/build/cmake_modules/ReadFileList.cmake)
-
-set(MRN_C_COMPILE_FLAGS "")
-set(MRN_CXX_COMPILE_FLAGS "")
-
-macro(mrn_check_cflag flag)
-  string(REGEX REPLACE "[-=]" "_" temporary_variable_name ${flag})
-  string(TOUPPER "${temporary_variable_name}" temporary_variable_name)
-  set(temporary_variable_name "CFLAG${temporary_variable_name}")
-  check_c_compiler_flag(${flag} ${temporary_variable_name})
-  if(${temporary_variable_name})
-    set(MRN_C_COMPILE_FLAGS "${MRN_C_COMPILE_FLAGS} ${flag}")
-  endif()
-endmacro()
-
-macro(mrn_check_cxxflag flag)
-  string(REGEX REPLACE "[-=]" "_" temporary_variable_name ${flag})
-  string(TOUPPER "${temporary_variable_name}" temporary_variable_name)
-  set(temporary_variable_name "CXXFLAG${temporary_variable_name}")
-  check_cxx_compiler_flag(${flag} ${temporary_variable_name})
-  if(${temporary_variable_name})
-    set(MRN_CXX_COMPILE_FLAGS "${MRN_CXX_COMPILE_FLAGS} ${flag}")
-  endif()
-endmacro()
-
-macro(mrn_build_flag flag)
-  mrn_check_cflag(${flag})
-  mrn_check_cxxflag(${flag})
-endmacro()
-
-if(MRN_BUNDLED)
-  set(MRN_RELATIVE_DIR_PREFIX "${MRN_SOURCE_DIR}/")
-else()
-  set(MRN_RELATIVE_DIR_PREFIX "")
-endif()
-
-read_file_list(${CMAKE_CURRENT_SOURCE_DIR}/sources.am MRN_SOURCES)
-read_file_list(${CMAKE_CURRENT_SOURCE_DIR}/lib/libmrn_no_mysql_sources.am
-  LIBMRN_NO_MYSQL_SOURCES)
-string(REGEX REPLACE "([^;]+)" "${MRN_RELATIVE_DIR_PREFIX}lib/\\1"
-  LIBMRN_NO_MYSQL_SOURCES "${LIBMRN_NO_MYSQL_SOURCES}")
-read_file_list(${CMAKE_CURRENT_SOURCE_DIR}/lib/libmrn_need_mysql_sources.am
-  LIBMRN_NEED_MYSQL_SOURCES)
-string(REGEX REPLACE "([^;]+)" "${MRN_RELATIVE_DIR_PREFIX}lib/\\1"
-  LIBMRN_NEED_MYSQL_SOURCES "${LIBMRN_NEED_MYSQL_SOURCES}")
-read_file_list(${CMAKE_CURRENT_SOURCE_DIR}/udf/sources.am MRN_UDF_SOURCES)
-string(REGEX REPLACE "([^;]+)" "${MRN_RELATIVE_DIR_PREFIX}udf/\\1"
-  MRN_UDF_SOURCES "${MRN_UDF_SOURCES}")
-
-if(MRN_BUNDLED)
-  set(MYSQL_SOURCE_DIR ${CMAKE_SOURCE_DIR})
-  set(MYSQL_BUILD_DIR ${MYSQL_SOURCE_DIR})
-  set(MYSQL_CONFIG ${CMAKE_SOURCE_DIR}/scripts/mysql_config)
-else()
-  set(MYSQL_SOURCE_DIR "/PATH/TO/MYSQL/SOURCE/DIRECTORY/"
-    CACHE PATH "MySQL source directory")
-  if(NOT EXISTS ${MYSQL_SOURCE_DIR})
-    message(FATAL_ERROR
-      "MySQL source directory (MYSQL_SOURCE_DIR) doesn't exist: <${MYSQL_SOURCE_DIR}>")
-  endif()
-  set(MYSQL_BUILD_DIR ${MYSQL_SOURCE_DIR} CACHE PATH "MySQL build directory")
-  set(MYSQL_CONFIG "mysql_config" CACHE PATH "mysql-config command path")
-endif()
-find_path(MYSQL_CONFIG "${MYSQL_CONFIG}")
 
 if(EXISTS "${MYSQL_SOURCE_DIR}/storage/maria")
   set(MYSQL_VARIANT "MariaDB")
@@ -311,17 +291,8 @@ link_directories(
   ${MRN_LIBRARY_DIRS}
   ${MYSQL_LIBRARY_DIRS})
 
-set(MRN_ALL_SOURCES
-  ${MRN_SOURCES}
-  ${MRN_UDF_SOURCES}
-  ${LIBMRN_NO_MYSQL_SOURCES}
-  ${LIBMRN_NEED_MYSQL_SOURCES})
-
 if(MRN_BUNDLED)
-  mysql_add_plugin(mroonga
-    ${MRN_ALL_SOURCES}
-    STORAGE_ENGINE MODULE_ONLY
-    LINK_LIBRARIES ${MRN_LIBRARIES})
+  target_link_libraries(mroonga ${MRN_LIBRARIES})
 else()
   add_library(mroonga MODULE ${MRN_ALL_SOURCES})
 
@@ -360,19 +331,15 @@ else()
   endif()
 
   if(CMAKE_COMPILER_IS_GNUCXX)
-    mrn_build_flag("-Wall")
-    mrn_build_flag("-Wextra")
-    mrn_build_flag("-Wno-unused-parameter")
-    mrn_build_flag("-Wno-strict-aliasing")
-    mrn_build_flag("-Wno-deprecated")
-    mrn_check_cxxflag("-fno-implicit-templates")
-    if(("${MYSQL_VARIANT}" STREQUAL "MariaDB") OR
-        ("${MYSQL_VARIANT}" STREQUAL "MySQL" AND
-         ${MYSQL_VERSION} VERSION_LESS "5.7.0"))
-      mrn_check_cxxflag("-fno-exceptions")
-      mrn_check_cxxflag("-fno-rtti")
-    endif()
-    mrn_check_cxxflag("-felide-constructors")
+    MY_CHECK_AND_SET_COMPILER_FLAG("-Wall")
+    MY_CHECK_AND_SET_COMPILER_FLAG("-Wextra")
+    MY_CHECK_AND_SET_COMPILER_FLAG("-Wno-unused-parameter")
+    MY_CHECK_AND_SET_COMPILER_FLAG("-Wno-strict-aliasing")
+    MY_CHECK_AND_SET_COMPILER_FLAG("-Wno-deprecated")
+    MY_CHECK_AND_SET_COMPILER_FLAG("-fno-implicit-templates")
+    MY_CHECK_AND_SET_COMPILER_FLAG("-fno-exceptions")
+    MY_CHECK_AND_SET_COMPILER_FLAG("-fno-rtti")
+    MY_CHECK_AND_SET_COMPILER_FLAG("-felide-constructors")
   endif()
   set_source_files_properties(${MRN_SOURCES} PROPERTIES
     COMPILE_FLAGS "${MYSQL_CFLAGS} ${MRN_CXX_COMPILE_FLAGS}")
@@ -392,11 +359,9 @@ else()
 endif()
 
 if(GROONGA_NORMALIZER_MYSQL_FOUND)
-  set_property(TARGET mroonga APPEND PROPERTY
-    COMPILE_DEFINITIONS "WITH_GROONGA_NORMALIZER_MYSQL=1")
+  add_definitions("-DWITH_GROONGA_NORMALIZER_MYSQL=1")
   if(MRN_GROONGA_NORMALIZER_MYSQL_EMBED)
-    set_property(TARGET mroonga APPEND PROPERTY
-      COMPILE_DEFINITIONS "MRN_GROONGA_NORMALIZER_MYSQL_EMBEDDED")
+    add_definitions("-DMRN_GROONGA_NORMALIZER_MYSQL_EMBEDDED")
   else()
     set_property(TARGET mroonga APPEND PROPERTY
       COMPILE_DEFINITIONS "GROONGA_NORMALIZER_MYSQL_PLUGIN_NAME=\"normalizers/mysql\"")
@@ -404,8 +369,7 @@ if(GROONGA_NORMALIZER_MYSQL_FOUND)
 endif()
 
 if(MRN_GROONGA_EMBED)
-  set_property(TARGET mroonga APPEND PROPERTY
-    COMPILE_DEFINITIONS "MRN_GROONGA_EMBEDDED")
+  add_definitions("-DMRN_GROONGA_EMBEDDED")
 endif()
 
 set(MRN_DEFAULT_PARSER "" CACHE STRING

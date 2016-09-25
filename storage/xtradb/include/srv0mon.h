@@ -2,7 +2,7 @@
 
 Copyright (c) 2010, 2013, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2012, Facebook Inc.
-Copyright (c) 2013, SkySQL Ab. All Rights Reserved.
+Copyright (c) 2013, 2016, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it
 under the terms of the GNU General Public License as published by the
@@ -167,6 +167,7 @@ enum monitor_id_t {
 	MONITOR_OVLD_INDEX_PAGES_WRITTEN,
 	MONITOR_OVLD_NON_INDEX_PAGES_WRITTEN,
 	MONITOR_OVLD_PAGES_READ,
+	MONITOR_OVLD_PAGES0_READ,
 	MONITOR_OVLD_INDEX_SEC_REC_CLUSTER_READS,
 	MONITOR_OVLD_INDEX_SEC_REC_CLUSTER_READS_AVOIDED,
 	MONITOR_OVLD_BYTE_READ,
@@ -379,6 +380,8 @@ enum monitor_id_t {
 	MONITOR_SRV_MEM_VALIDATE_MICROSECOND,
 	MONITOR_SRV_PURGE_MICROSECOND,
 	MONITOR_SRV_DICT_LRU_MICROSECOND,
+	MONITOR_SRV_DICT_LRU_EVICT_COUNT_ACTIVE,
+	MONITOR_SRV_DICT_LRU_EVICT_COUNT_IDLE,
 	MONITOR_SRV_CHECKPOINT_MICROSECOND,
 	MONITOR_OVLD_SRV_DBLWR_WRITES,
 	MONITOR_OVLD_SRV_DBLWR_PAGES_WRITTEN,

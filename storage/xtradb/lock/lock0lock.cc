@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2015, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2016, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2014, 2015, MariaDB Corporation
 
 This program is free software; you can redistribute it and/or modify it under
@@ -53,6 +53,9 @@ Created 5/7/1996 Heikki Tuuri
 #include "mysql/plugin.h"
 
 #include <mysql/service_wsrep.h>
+
+#include <string>
+#include <sstream>
 
 /* Restricts the length of search we will do in the waits-for
 graph of transactions */
@@ -426,7 +429,7 @@ ibool
 lock_rec_validate_page(
 /*===================*/
 	const buf_block_t*	block)	/*!< in: buffer block */
-	__attribute__((nonnull, warn_unused_result));
+	MY_ATTRIBUTE((nonnull, warn_unused_result));
 #endif /* UNIV_DEBUG */
 
 /* The lock system */
@@ -510,7 +513,7 @@ Checks that a transaction id is sensible, i.e., not in the future.
 #ifdef UNIV_DEBUG
 UNIV_INTERN
 #else
-static __attribute__((nonnull, warn_unused_result))
+static MY_ATTRIBUTE((nonnull, warn_unused_result))
 #endif
 bool
 lock_check_trx_id_sanity(
@@ -636,7 +639,7 @@ lock_sys_create(
 	lock_sys->rec_num = 0;
 
 	if (!srv_read_only_mode) {
-		lock_latest_err_file = os_file_create_tmpfile();
+		lock_latest_err_file = os_file_create_tmpfile(NULL);
 		ut_a(lock_latest_err_file);
 	}
 }
@@ -657,6 +660,17 @@ lock_sys_close(void)
 
 	mutex_free(&lock_sys->mutex);
 	mutex_free(&lock_sys->wait_mutex);
+
+	os_event_free(lock_sys->timeout_event);
+
+	for (srv_slot_t* slot = lock_sys->waiting_threads;
+	     slot < lock_sys->waiting_threads + OS_THREAD_MAX_N; slot++) {
+
+		ut_ad(!slot->in_use);
+		ut_ad(!slot->thr);
+		if (slot->event != NULL)
+			os_event_free(slot->event);
+	}
 
 	mem_free(lock_stack);
 	mem_free(lock_sys);
@@ -1627,7 +1641,7 @@ lock_rec_discard(lock_t*	in_lock);
 /*********************************************************************//**
 Checks if some other transaction has a lock request in the queue.
 @return	lock or NULL */
-static __attribute__((nonnull, warn_unused_result))
+static MY_ATTRIBUTE((nonnull, warn_unused_result))
 const lock_t*
 lock_rec_other_has_expl_req(
 /*========================*/
@@ -1678,6 +1692,10 @@ wsrep_kill_victim(
 {
         ut_ad(lock_mutex_own());
         ut_ad(trx_mutex_own(lock->trx));
+
+	/* quit for native mysql */
+	if (!wsrep_on(trx->mysql_thd)) return;
+
 	my_bool bf_this  = wsrep_thd_is_BF(trx->mysql_thd, FALSE);
 	my_bool bf_other = wsrep_thd_is_BF(lock->trx->mysql_thd, TRUE);
 
@@ -1726,8 +1744,10 @@ wsrep_kill_victim(
 				}
 			}
 
+			lock->trx->abort_type = TRX_WSREP_ABORT;
 			wsrep_innobase_kill_one_trx(trx->mysql_thd,
 				(const trx_t*) trx, lock->trx, TRUE);
+			lock->trx->abort_type = TRX_SERVER_ABORT;
 		}
 	}
 }
@@ -1762,9 +1782,11 @@ lock_rec_other_has_conflicting(
 
 #ifdef WITH_WSREP
 		if (lock_rec_has_to_wait(TRUE, trx, mode, lock, is_supremum)) {
-			trx_mutex_enter(lock->trx);
-			wsrep_kill_victim((trx_t *)trx, (lock_t *)lock);
-			trx_mutex_exit(lock->trx);
+			if (wsrep_on(trx->mysql_thd)) {
+				trx_mutex_enter(lock->trx);
+				wsrep_kill_victim(trx, lock);
+				trx_mutex_exit(lock->trx);
+			}
 #else
  		if (lock_rec_has_to_wait(trx, mode, lock, is_supremum)) {
 #endif /* WITH_WSREP */
@@ -2070,7 +2092,9 @@ lock_rec_create(
 	ut_ad(index->table->n_ref_count > 0 || !index->table->can_be_evicted);
 
 #ifdef WITH_WSREP
-	if (c_lock && wsrep_thd_is_BF(trx->mysql_thd, FALSE)) {
+	if (c_lock                      &&
+	    wsrep_on(trx->mysql_thd)    &&
+	    wsrep_thd_is_BF(trx->mysql_thd, FALSE)) {
 		lock_t *hash	= (lock_t *)c_lock->hash;
 		lock_t *prev	= NULL;
 
@@ -3016,8 +3040,8 @@ lock_rec_inherit_to_gap(
 	/* If srv_locks_unsafe_for_binlog is TRUE or session is using
 	READ COMMITTED isolation level, we do not want locks set
 	by an UPDATE or a DELETE to be inherited as gap type locks. But we
-	DO want S-locks set by a consistency constraint to be inherited also
-	then. */
+	DO want S-locks/X-locks(taken for replace) set by a consistency
+	constraint to be inherited also then */
 
 	for (lock = lock_rec_get_first(block, heap_no);
 	     lock != NULL;
@@ -3027,7 +3051,8 @@ lock_rec_inherit_to_gap(
 		    && !((srv_locks_unsafe_for_binlog
 			  || lock->trx->isolation_level
 			  <= TRX_ISO_READ_COMMITTED)
-			 && lock_get_mode(lock) == LOCK_X)) {
+			 && lock_get_mode(lock) ==
+			 (lock->trx->duplicates ? LOCK_S : LOCK_X))) {
 
 			lock_rec_add_to_queue(
 				LOCK_REC | LOCK_GAP | lock_get_mode(lock),
@@ -4038,7 +4063,7 @@ lock_get_next_lock(
 			ut_ad(heap_no == ULINT_UNDEFINED);
 			ut_ad(lock_get_type_low(lock) == LOCK_TABLE);
 
-			lock = UT_LIST_GET_PREV(un_member.tab_lock.locks, lock);
+			lock = UT_LIST_GET_NEXT(un_member.tab_lock.locks, lock);
 		}
 	} while (lock != NULL
 		 && lock->trx->lock.deadlock_mark > ctx->mark_start);
@@ -4088,7 +4113,8 @@ lock_get_first_lock(
 	} else {
 		*heap_no = ULINT_UNDEFINED;
 		ut_ad(lock_get_type_low(lock) == LOCK_TABLE);
-		lock = UT_LIST_GET_PREV(un_member.tab_lock.locks, lock);
+		dict_table_t*   table = lock->un_member.tab_lock.table;
+		lock = UT_LIST_GET_FIRST(table->locks);
 	}
 
 	ut_a(lock != NULL);
@@ -4468,9 +4494,9 @@ lock_report_waiters_to_mysql(
 				innobase_kill_query. We mark this by setting
 				current_lock_mutex_owner, so we can avoid trying
 				to recursively take lock_sys->mutex. */
-				w_trx->current_lock_mutex_owner = mysql_thd;
+				w_trx->abort_type = TRX_REPLICATION_ABORT;
 				thd_report_wait_for(mysql_thd, w_trx->mysql_thd);
-				w_trx->current_lock_mutex_owner = NULL;
+				w_trx->abort_type = TRX_SERVER_ABORT;
 			}
 			++i;
 		}
@@ -4560,8 +4586,6 @@ lock_deadlock_check_and_resolve(
 			}
 #endif /* WITH_WSREP */
 
-			MONITOR_INC(MONITOR_DEADLOCK);
-
 		} else if (victim_trx_id != 0 && victim_trx_id != trx->id) {
 
 			ut_ad(victim_trx_id == ctx.wait_lock->trx->id);
@@ -4570,14 +4594,15 @@ lock_deadlock_check_and_resolve(
 			lock_deadlock_found = TRUE;
 
 			MONITOR_INC(MONITOR_DEADLOCK);
+			srv_stats.lock_deadlock_count.inc();
 		}
-
 	} while (victim_trx_id != 0 && victim_trx_id != trx->id);
 
 	/* If the joining transaction was selected as the victim. */
 	if (victim_trx_id != 0) {
 		ut_a(victim_trx_id == trx->id);
 
+		MONITOR_INC(MONITOR_DEADLOCK);
 		srv_stats.lock_deadlock_count.inc();
 
 		lock_deadlock_fputs("*** WE ROLL BACK TRANSACTION (2)\n");
@@ -4694,10 +4719,10 @@ lock_table_create(
 			trx_mutex_exit(c_lock->trx);
 		}
 	} else {
-		UT_LIST_ADD_LAST(un_member.tab_lock.locks, table->locks, lock);
-	}
-#else
+#endif /* WITH_WSREP */
 	UT_LIST_ADD_LAST(un_member.tab_lock.locks, table->locks, lock);
+#ifdef WITH_WSREP
+	}
 #endif /* WITH_WSREP */
 
 	if (UNIV_UNLIKELY(type_mode & LOCK_WAIT)) {
@@ -5030,7 +5055,8 @@ lock_table(
 	dberr_t		err;
 	const lock_t*	wait_for;
 
-	ut_ad(table && thr);
+	ut_ad(table != NULL);
+	ut_ad(thr != NULL);
 
 	if (flags & BTR_NO_LOCKING_FLAG) {
 
@@ -6478,7 +6504,7 @@ lock_validate_table_locks(
 /*********************************************************************//**
 Validate record locks up to a limit.
 @return lock at limit or NULL if no more locks in the hash bucket */
-static __attribute__((nonnull, warn_unused_result))
+static MY_ATTRIBUTE((nonnull, warn_unused_result))
 const lock_t*
 lock_rec_validate(
 /*==============*/
@@ -6884,8 +6910,9 @@ lock_clust_rec_modify_check_and_lock(
 	lock_rec_convert_impl_to_expl(block, rec, index, offsets);
 
 	lock_mutex_enter();
+	trx_t*		trx = thr_get_trx(thr);
 
-	ut_ad(lock_table_has(thr_get_trx(thr), index->table, LOCK_IX));
+	ut_ad(lock_table_has(trx, index->table, LOCK_IX));
 
 	err = lock_rec_lock(TRUE, LOCK_X | LOCK_REC_NOT_GAP,
 			    block, heap_no, index, thr);
@@ -6947,9 +6974,10 @@ lock_sec_rec_modify_check_and_lock(
 	index record, and this would not have been possible if another active
 	transaction had modified this secondary index record. */
 
+	trx_t* trx = thr_get_trx(thr);
 	lock_mutex_enter();
 
-	ut_ad(lock_table_has(thr_get_trx(thr), index->table, LOCK_IX));
+	ut_ad(lock_table_has(trx, index->table, LOCK_IX));
 
 	err = lock_rec_lock(TRUE, LOCK_X | LOCK_REC_NOT_GAP,
 			    block, heap_no, index, thr);
@@ -7055,12 +7083,13 @@ lock_sec_rec_read_check_and_lock(
 		lock_rec_convert_impl_to_expl(block, rec, index, offsets);
 	}
 
+	trx_t* trx = thr_get_trx(thr);
 	lock_mutex_enter();
 
 	ut_ad(mode != LOCK_X
-	      || lock_table_has(thr_get_trx(thr), index->table, LOCK_IX));
+	      || lock_table_has(trx, index->table, LOCK_IX));
 	ut_ad(mode != LOCK_S
-	      || lock_table_has(thr_get_trx(thr), index->table, LOCK_IS));
+	      || lock_table_has(trx, index->table, LOCK_IS));
 
 	err = lock_rec_lock(FALSE, mode | gap_mode,
 			    block, heap_no, index, thr);
@@ -7137,11 +7166,12 @@ lock_clust_rec_read_check_and_lock(
 	}
 
 	lock_mutex_enter();
+	trx_t* trx = thr_get_trx(thr);
 
 	ut_ad(mode != LOCK_X
-	      || lock_table_has(thr_get_trx(thr), index->table, LOCK_IX));
+	      || lock_table_has(trx, index->table, LOCK_IX));
 	ut_ad(mode != LOCK_S
-	      || lock_table_has(thr_get_trx(thr), index->table, LOCK_IS));
+	      || lock_table_has(trx, index->table, LOCK_IS));
 
 	err = lock_rec_lock(FALSE, mode | gap_mode,
 			    block, heap_no, index, thr);
@@ -7291,6 +7321,19 @@ lock_get_type(
 	const lock_t*	lock)	/*!< in: lock */
 {
 	return(lock_get_type_low(lock));
+}
+
+/*******************************************************************//**
+Gets the trx of the lock. Non-inline version for using outside of the
+lock module.
+@return	trx_t* */
+UNIV_INTERN
+trx_t*
+lock_get_trx(
+/*=========*/
+	const lock_t*	lock)	/*!< in: lock */
+{
+	return (lock->trx);
 }
 
 /*******************************************************************//**
@@ -7884,3 +7927,32 @@ lock_trx_has_rec_x_lock(
 	return(true);
 }
 #endif /* UNIV_DEBUG */
+
+/*******************************************************************//**
+Get lock mode and table/index name
+@return	string containing lock info */
+std::string
+lock_get_info(
+	const lock_t* lock)
+{
+	std::string info;
+	std::string mode("mode ");
+	std::string index("index ");
+	std::string table("table ");
+	std::string n_uniq(" n_uniq");
+	std::string n_user(" n_user");
+	std::string lock_mode((lock_get_mode_str(lock)));
+	std::string iname(lock->index->name);
+	std::string tname(lock->index->table_name);
+
+#define SSTR( x ) reinterpret_cast< std::ostringstream & >(	\
+        ( std::ostringstream() << std::dec << x ) ).str()
+
+	info = mode + lock_mode
+		+ index + iname
+		+ table + tname
+		+ n_uniq + SSTR(lock->index->n_uniq)
+		+ n_user + SSTR(lock->index->n_user_defined_cols);
+
+	return info;
+}

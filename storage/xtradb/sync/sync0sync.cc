@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2015, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2016, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2008, Google Inc.
 
 Portions of this file contain modifications contributed and copyrighted by
@@ -212,10 +212,7 @@ UNIV_INTERN mysql_pfs_key_t	sync_thread_mutex_key;
 /** Global list of database mutexes (not OS mutexes) created. */
 UNIV_INTERN ut_list_base_node_t  mutex_list;
 
-/** Global list of priority mutexes. A subset of mutex_list */
-UNIV_INTERN UT_LIST_BASE_NODE_T(ib_prio_mutex_t)  prio_mutex_list;
-
-/** Mutex protecting the mutex_list and prio_mutex_list variables */
+/** Mutex protecting the mutex_list variable */
 UNIV_INTERN ib_mutex_t mutex_list_mutex;
 
 #ifdef UNIV_PFS_MUTEX
@@ -280,7 +277,7 @@ mutex_create_func(
 	os_fast_mutex_init(PFS_NOT_INSTRUMENTED, &mutex->os_fast_mutex);
 	mutex->lock_word = 0;
 #endif
-	mutex->event = os_event_create();
+	os_event_create(&mutex->event);
 	mutex_set_waiters(mutex, 0);
 #ifdef UNIV_DEBUG
 	mutex->magic_n = MUTEX_MAGIC_N;
@@ -349,11 +346,7 @@ mutex_create_func(
 			  cline,
 			  cmutex_name);
 	mutex->high_priority_waiters = 0;
-	mutex->high_priority_event = os_event_create();
-
-	mutex_enter(&mutex_list_mutex);
-	UT_LIST_ADD_FIRST(list, prio_mutex_list, mutex);
-	mutex_exit(&mutex_list_mutex);
+	os_event_create(&mutex->high_priority_event);
 }
 
 /******************************************************************//**
@@ -400,7 +393,7 @@ mutex_free_func(
 		mutex_exit(&mutex_list_mutex);
 	}
 
-	os_event_free(mutex->event);
+	os_event_free(&mutex->event, false);
 #ifdef UNIV_MEM_DEBUG
 func_exit:
 #endif /* UNIV_MEM_DEBUG */
@@ -427,12 +420,8 @@ mutex_free_func(
 /*============*/
 	ib_prio_mutex_t*	mutex)	/*!< in: mutex */
 {
-	mutex_enter(&mutex_list_mutex);
-	UT_LIST_REMOVE(list, prio_mutex_list, mutex);
-	mutex_exit(&mutex_list_mutex);
-
 	ut_a(mutex->high_priority_waiters == 0);
-	os_event_free(mutex->high_priority_event);
+	os_event_free(&mutex->high_priority_event, false);
 	mutex_free_func(&mutex->base_mutex);
 }
 
@@ -446,10 +435,10 @@ ulint
 mutex_enter_nowait_func(
 /*====================*/
 	ib_mutex_t*	mutex,		/*!< in: pointer to mutex */
-	const char*	file_name __attribute__((unused)),
+	const char*	file_name MY_ATTRIBUTE((unused)),
 					/*!< in: file name where mutex
 					requested */
-	ulint		line __attribute__((unused)))
+	ulint		line MY_ATTRIBUTE((unused)))
 					/*!< in: line where requested */
 {
 	ut_ad(mutex_validate(mutex));
@@ -482,7 +471,13 @@ mutex_validate(
 	const ib_mutex_t*	mutex)	/*!< in: mutex */
 {
 	ut_a(mutex);
-	ut_a(mutex->magic_n == MUTEX_MAGIC_N);
+
+	if (mutex->magic_n != MUTEX_MAGIC_N) {
+		ib_logf(IB_LOG_LEVEL_ERROR,
+			"Mutex %p not initialized file %s line %lu.",
+			mutex, mutex->cfile_name, mutex->cline);
+	}
+	ut_ad(mutex->magic_n == MUTEX_MAGIC_N);
 
 	return(TRUE);
 }
@@ -716,7 +711,7 @@ mutex_signal_object(
 
 	/* The memory order of resetting the waiters field and
 	signaling the object is important. See LEMMA 1 above. */
-	os_event_set(mutex->event);
+	os_event_set(&mutex->event);
 	sync_array_object_signalled();
 }
 
@@ -1549,7 +1544,6 @@ sync_init(void)
 	/* Init the mutex list and create the mutex to protect it. */
 
 	UT_LIST_INIT(mutex_list);
-	UT_LIST_INIT(prio_mutex_list);
 	mutex_create(mutex_list_mutex_key, &mutex_list_mutex,
 		     SYNC_NO_ORDER_CHECK);
 #ifdef UNIV_SYNC_DEBUG
@@ -1596,22 +1590,17 @@ sync_thread_level_arrays_free(void)
 #endif /* UNIV_SYNC_DEBUG */
 
 /******************************************************************//**
-Frees the resources in InnoDB's own synchronization data structures. Use
-os_sync_free() after calling this. */
+Frees the resources in InnoDB's own synchronization data structures. */
 UNIV_INTERN
 void
 sync_close(void)
 /*===========*/
 {
 	ib_mutex_t*		mutex;
-	ib_prio_mutex_t*	prio_mutex;
 
 	sync_array_close();
 
-	for (prio_mutex = UT_LIST_GET_FIRST(prio_mutex_list); prio_mutex;) {
-		mutex_free(prio_mutex);
-		prio_mutex = UT_LIST_GET_FIRST(prio_mutex_list);
-	}
+	mutex_free(&rw_lock_list_mutex);
 
 	for (mutex = UT_LIST_GET_FIRST(mutex_list);
 	     mutex != NULL;
@@ -1629,7 +1618,6 @@ sync_close(void)
 		mutex = UT_LIST_GET_FIRST(mutex_list);
 	}
 
-	mutex_free(&mutex_list_mutex);
 #ifdef UNIV_SYNC_DEBUG
 	mutex_free(&sync_thread_mutex);
 
@@ -1639,6 +1627,8 @@ sync_close(void)
 	sync_thread_level_arrays_free();
 	os_fast_mutex_free(&rw_lock_debug_mutex);
 #endif /* UNIV_SYNC_DEBUG */
+
+	mutex_free(&mutex_list_mutex);
 
 	sync_initialized = FALSE;
 }
@@ -1651,34 +1641,49 @@ sync_print_wait_info(
 /*=================*/
 	FILE*	file)		/*!< in: file where to print */
 {
+	// Sum counter values once
+	ib_int64_t mutex_spin_wait_count_val
+		= static_cast<ib_int64_t>(mutex_spin_wait_count);
+	ib_int64_t mutex_spin_round_count_val
+		= static_cast<ib_int64_t>(mutex_spin_round_count);
+	ib_int64_t mutex_os_wait_count_val
+		= static_cast<ib_int64_t>(mutex_os_wait_count);
+	ib_int64_t rw_s_spin_wait_count_val
+		= static_cast<ib_int64_t>(rw_lock_stats.rw_s_spin_wait_count);
+	ib_int64_t rw_s_spin_round_count_val
+		= static_cast<ib_int64_t>(rw_lock_stats.rw_s_spin_round_count);
+	ib_int64_t rw_s_os_wait_count_val
+		= static_cast<ib_int64_t>(rw_lock_stats.rw_s_os_wait_count);
+	ib_int64_t rw_x_spin_wait_count_val
+		= static_cast<ib_int64_t>(rw_lock_stats.rw_x_spin_wait_count);
+	ib_int64_t rw_x_spin_round_count_val
+		= static_cast<ib_int64_t>(rw_lock_stats.rw_x_spin_round_count);
+	ib_int64_t rw_x_os_wait_count_val
+		= static_cast<ib_int64_t>(rw_lock_stats.rw_x_os_wait_count);
+
 	fprintf(file,
-		"Mutex spin waits " UINT64PF ", rounds " UINT64PF ", "
-		"OS waits " UINT64PF "\n"
-		"RW-shared spins " UINT64PF ", rounds " UINT64PF ", "
-		"OS waits " UINT64PF "\n"
-		"RW-excl spins " UINT64PF ", rounds " UINT64PF ", "
-		"OS waits " UINT64PF "\n",
-		(ib_uint64_t) mutex_spin_wait_count,
-		(ib_uint64_t) mutex_spin_round_count,
-		(ib_uint64_t) mutex_os_wait_count,
-		(ib_uint64_t) rw_lock_stats.rw_s_spin_wait_count,
-		(ib_uint64_t) rw_lock_stats.rw_s_spin_round_count,
-		(ib_uint64_t) rw_lock_stats.rw_s_os_wait_count,
-		(ib_uint64_t) rw_lock_stats.rw_x_spin_wait_count,
-		(ib_uint64_t) rw_lock_stats.rw_x_spin_round_count,
-		(ib_uint64_t) rw_lock_stats.rw_x_os_wait_count);
+		"Mutex spin waits " INT64PF ", rounds " INT64PF ", "
+		"OS waits " INT64PF "\n"
+		"RW-shared spins " INT64PF ", rounds " INT64PF ", "
+		"OS waits " INT64PF "\n"
+		"RW-excl spins " INT64PF ", rounds " INT64PF ", "
+		"OS waits " INT64PF "\n",
+		mutex_spin_wait_count_val, mutex_spin_round_count_val,
+		mutex_os_wait_count_val,
+		rw_s_spin_wait_count_val, rw_s_spin_round_count_val,
+		rw_s_os_wait_count_val,
+		rw_x_spin_wait_count_val, rw_x_spin_round_count_val,
+		rw_x_os_wait_count_val);
 
 	fprintf(file,
 		"Spin rounds per wait: %.2f mutex, %.2f RW-shared, "
 		"%.2f RW-excl\n",
-		(double) mutex_spin_round_count /
-		(mutex_spin_wait_count ? mutex_spin_wait_count : 1),
-		(double) rw_lock_stats.rw_s_spin_round_count /
-		(rw_lock_stats.rw_s_spin_wait_count
-		 ? rw_lock_stats.rw_s_spin_wait_count : 1),
-		(double) rw_lock_stats.rw_x_spin_round_count /
-		(rw_lock_stats.rw_x_spin_wait_count
-		 ? rw_lock_stats.rw_x_spin_wait_count : 1));
+		(double) mutex_spin_round_count_val /
+		(mutex_spin_wait_count_val ? mutex_spin_wait_count_val : 1LL),
+		(double) rw_s_spin_round_count_val /
+		(rw_s_spin_wait_count_val ? rw_s_spin_wait_count_val : 1LL),
+		(double) rw_x_spin_round_count_val /
+		(rw_x_spin_wait_count_val ? rw_x_spin_wait_count_val : 1LL));
 }
 
 /*******************************************************************//**

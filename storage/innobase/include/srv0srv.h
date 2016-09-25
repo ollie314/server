@@ -1,9 +1,9 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2013, Oracle and/or its affiliates. All rights reserved.
+Copyright (c) 1995, 2016, Oracle and/or its affiliates. All rights reserved.
 Copyright (c) 2008, 2009, Google Inc.
 Copyright (c) 2009, Percona Inc.
-Copyright (c) 2013, 2015, MariaDB Corporation. All Rights Reserved.
+Copyright (c) 2013, 2016, MariaDB Corporation
 
 Portions of this file contain modifications contributed and copyrighted by
 Google, Inc. Those modifications are gratefully acknowledged and are described
@@ -179,6 +179,9 @@ struct srv_stats_t {
 
 	/** Number of times prefix optimization avoided triggering cluster lookup */
 	ulint_ctr_64_t		n_sec_rec_cluster_reads_avoided;
+
+	/** Number of times page 0 is read from tablespace */
+	ulint_ctr_64_t		page0_read;
 };
 
 extern const char*	srv_main_thread_op_info;
@@ -241,6 +244,9 @@ extern char*	srv_arch_dir;
 recovery and open all tables in RO mode instead of RW mode. We don't
 sync the max trx id to disk either. */
 extern my_bool	srv_read_only_mode;
+/** Set if InnoDB operates in read-only mode or innodb-force-recovery
+is greater than SRV_FORCE_NO_TRX_UNDO. */
+extern my_bool	high_level_read_only;
 /** store to its own file each table created by an user; data
 dictionary tables are in the system tablespace 0 */
 extern my_bool	srv_file_per_table;
@@ -271,6 +277,7 @@ OS (provided we compiled Innobase with it in), otherwise we will
 use simulated aio we build below with threads.
 Currently we support native aio on windows and linux */
 extern my_bool	srv_use_native_aio;
+extern my_bool	srv_numa_interleave;
 
 /* Use trim operation */
 extern my_bool srv_use_trim;
@@ -367,6 +374,8 @@ extern ulong	srv_flush_neighbors;	/*!< whether or not to flush
 					neighbors of a block */
 extern ulint	srv_buf_pool_old_size;	/*!< previously requested size */
 extern ulint	srv_buf_pool_curr_size;	/*!< current size in bytes */
+extern ulong	srv_buf_pool_dump_pct;	/*!< dump that may % of each buffer
+					pool during BP dump */
 extern ulint	srv_mem_pool_size;
 extern ulint	srv_lock_table_size;
 
@@ -852,7 +861,7 @@ UNIV_INTERN
 os_thread_ret_t
 DECLARE_THREAD(srv_purge_coordinator_thread)(
 /*=========================================*/
-	void*	arg __attribute__((unused)));	/*!< in: a dummy parameter
+	void*	arg MY_ATTRIBUTE((unused)));	/*!< in: a dummy parameter
 						required by os_thread_create */
 
 /*********************************************************************//**
@@ -862,7 +871,7 @@ UNIV_INTERN
 os_thread_ret_t
 DECLARE_THREAD(srv_worker_thread)(
 /*==============================*/
-	void*	arg __attribute__((unused)));	/*!< in: a dummy parameter
+	void*	arg MY_ATTRIBUTE((unused)));	/*!< in: a dummy parameter
 						required by os_thread_create */
 } /* extern "C" */
 
@@ -944,7 +953,8 @@ struct export_var_t{
 	ulint innodb_os_log_pending_fsyncs;	/*!< fil_n_pending_log_flushes */
 	ulint innodb_page_size;			/*!< UNIV_PAGE_SIZE */
 	ulint innodb_pages_created;		/*!< buf_pool->stat.n_pages_created */
-	ulint innodb_pages_read;		/*!< buf_pool->stat.n_pages_read */
+	ulint innodb_pages_read;		/*!< buf_pool->stat.n_pages_read*/
+	ulint innodb_page0_read;		/*!< srv_stats.page0_read */
 	ulint innodb_pages_written;		/*!< buf_pool->stat.n_pages_written */
 	ulint innodb_row_lock_waits;		/*!< srv_n_lock_wait_count */
 	ulint innodb_row_lock_current_waits;	/*!< srv_n_lock_wait_current_count */
@@ -1068,6 +1078,7 @@ struct srv_slot_t{
 #else /* !UNIV_HOTBACKUP */
 # define srv_use_adaptive_hash_indexes		FALSE
 # define srv_use_native_aio			FALSE
+# define srv_numa_interleave			FALSE
 # define srv_force_recovery			0UL
 # define srv_set_io_thread_op_info(t,info)	((void) 0)
 # define srv_reset_io_thread_op_info()		((void) 0)

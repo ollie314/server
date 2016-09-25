@@ -17,6 +17,7 @@
 #include "sql_class.h"
 #include "debug_sync.h"
 #include "sql_array.h"
+#include "rpl_rli.h"
 #include <lf.h>
 #include <mysqld_error.h>
 #include <mysql/plugin.h>
@@ -505,6 +506,10 @@ public:
 
   bitmap_t hog_lock_types_bitmap() const
   { return m_strategy->hog_lock_types_bitmap(); }
+
+#ifndef DBUG_OFF
+  bool check_if_conflicting_replication_locks(MDL_context *ctx);
+#endif
 
   /** List of granted tickets for this lock. */
   Ticket_list m_granted;
@@ -1064,12 +1069,21 @@ MDL_wait::timed_wait(MDL_context_owner *owner, struct timespec *abs_timeout,
          wait_result != ETIMEDOUT && wait_result != ETIME)
   {
 #ifdef WITH_WSREP
-    if (wsrep_thd_is_BF(owner->get_thd(), true))
+    // Allow tests to block the applier thread using the DBUG facilities
+    DBUG_EXECUTE_IF("sync.wsrep_before_mdl_wait",
+                 {
+                   const char act[]=
+                     "now "
+                     "wait_for signal.wsrep_before_mdl_wait";
+                   DBUG_ASSERT(!debug_sync_set_action((owner->get_thd()),
+                                                      STRING_WITH_LEN(act)));
+                 };);
+    if (wsrep_thd_is_BF(owner->get_thd(), false))
     {
       wait_result= mysql_cond_wait(&m_COND_wait_status, &m_LOCK_wait_status);
     }
     else
-#endif
+#endif /* WITH_WSREP */
     wait_result= mysql_cond_timedwait(&m_COND_wait_status, &m_LOCK_wait_status,
                                       abs_timeout);
   }
@@ -1170,7 +1184,8 @@ void MDL_lock::Ticket_list::add_ticket(MDL_ticket *ticket)
       if (granted->get_ctx() != ticket->get_ctx() &&
           granted->is_incompatible_when_granted(ticket->get_type()))
       {
-        if (!wsrep_grant_mdl_exception(ticket->get_ctx(), granted))
+        if (!wsrep_grant_mdl_exception(ticket->get_ctx(), granted,
+                                       &ticket->get_lock()->key))
         {
           WSREP_DEBUG("MDL victim killed at add_ticket");
         }
@@ -1561,7 +1576,7 @@ MDL_lock::can_grant_lock(enum_mdl_type type_arg,
                         wsrep_thd_query(requestor_ctx->get_thd()));
             can_grant = true;
           }
-          else if (!wsrep_grant_mdl_exception(requestor_ctx, ticket))
+          else if (!wsrep_grant_mdl_exception(requestor_ctx, ticket, &key))
           {
             wsrep_can_grant= FALSE;
             if (wsrep_log_conflicts)
@@ -1967,6 +1982,55 @@ MDL_context::clone_ticket(MDL_request *mdl_request)
 
 
 /**
+  Check if there is any conflicting lock that could cause this thread
+  to wait for another thread which is not ready to commit.
+  This is always an error, as the upper level of parallel replication
+  should not allow a scheduling of a conflicting DDL until all earlier
+  transactions has commited.
+
+  This function is only called for a slave using parallel replication
+  and trying to get an exclusive lock for the table.
+*/
+
+#ifndef DBUG_OFF
+bool MDL_lock::check_if_conflicting_replication_locks(MDL_context *ctx)
+{
+  Ticket_iterator it(m_granted);
+  MDL_ticket *conflicting_ticket;
+  rpl_group_info *rgi_slave= ctx->get_thd()->rgi_slave;
+
+  if (!rgi_slave->gtid_sub_id)
+    return 0;
+
+  while ((conflicting_ticket= it++))
+  {
+    if (conflicting_ticket->get_ctx() != ctx)
+    {
+      MDL_context *conflicting_ctx= conflicting_ticket->get_ctx();
+      rpl_group_info *conflicting_rgi_slave;
+      conflicting_rgi_slave= conflicting_ctx->get_thd()->rgi_slave;
+
+      /*
+        If the conflicting thread is another parallel replication
+        thread for the same master and it's not in commit stage, then
+        the current transaction has started too early and something is
+        seriously wrong.
+      */
+      if (conflicting_rgi_slave &&
+          conflicting_rgi_slave->gtid_sub_id &&
+          conflicting_rgi_slave->rli == rgi_slave->rli &&
+          conflicting_rgi_slave->current_gtid.domain_id ==
+          rgi_slave->current_gtid.domain_id &&
+          !conflicting_rgi_slave->did_mark_start_commit)
+        return 1;                               // Fatal error
+    }
+  }
+  return 0;
+}
+#endif
+
+
+/**
   Acquire one lock with waiting for conflicting locks to go away if needed.
 
   @param mdl_request [in/out] Lock request object for lock to be acquired
@@ -2026,6 +2090,19 @@ MDL_context::acquire_lock(MDL_request *mdl_request, double lock_wait_timeout)
   if (lock->needs_notification(ticket) && lock_wait_timeout)
     lock->notify_conflicting_locks(this);
 
+  /*
+    Ensure that if we are trying to get an exclusive lock for a slave
+    running parallel replication, then we are not blocked by another
+    parallel slave thread that is not committed. This should never happen as
+    the parallel replication scheduler should never schedule a DDL while
+    DML's are still running.
+  */
+  DBUG_ASSERT((mdl_request->type != MDL_INTENTION_EXCLUSIVE &&
+               mdl_request->type != MDL_EXCLUSIVE) ||
+              !(get_thd()->rgi_slave &&
+                get_thd()->rgi_slave->is_parallel_exec &&
+                lock->check_if_conflicting_replication_locks(this)));
+
   mysql_prlock_unlock(&lock->m_rwlock);
 
   will_wait_for(ticket);
@@ -2036,7 +2113,7 @@ MDL_context::acquire_lock(MDL_request *mdl_request, double lock_wait_timeout)
   find_deadlock();
 
   struct timespec abs_timeout, abs_shortwait;
-  set_timespec(abs_timeout, lock_wait_timeout);
+  set_timespec(abs_timeout, (ulonglong) lock_wait_timeout);
   set_timespec(abs_shortwait, 1);
   wait_status= MDL_wait::EMPTY;
 
@@ -2904,6 +2981,19 @@ void MDL_context::release_explicit_locks()
   release_locks_stored_before(MDL_EXPLICIT, NULL);
 }
 
+bool MDL_context::has_explicit_locks()
+{
+  MDL_ticket *ticket = NULL;
+
+  Ticket_iterator it(m_tickets[MDL_EXPLICIT]);
+
+  while ((ticket = it++))
+  {
+    return true;
+  }
+
+  return false;
+}
 
 #ifdef WITH_WSREP
 void MDL_ticket::wsrep_report(bool debug)

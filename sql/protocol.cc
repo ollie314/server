@@ -27,7 +27,6 @@
 
 #include <my_global.h>
 #include "sql_priv.h"
-#include "unireg.h"                    // REQUIRED: for other includes
 #include "protocol.h"
 #include "sql_class.h"                          // THD
 #include <stdarg.h>
@@ -374,7 +373,8 @@ bool net_send_error_packet(THD *thd, uint sql_errno, const char *err,
   uint error;
   char converted_err[MYSQL_ERRMSG_SIZE];
   char buff[2+1+SQLSTATE_LENGTH+MYSQL_ERRMSG_SIZE], *pos;
-
+  my_bool ret;
+  uint8 save_compress;
   DBUG_ENTER("send_error_packet");
 
   if (net->vio == 0)
@@ -402,8 +402,16 @@ bool net_send_error_packet(THD *thd, uint sql_errno, const char *err,
   /* Converted error message is always null-terminated. */
   length= (uint) (strmake(pos, converted_err, MYSQL_ERRMSG_SIZE - 1) - buff);
 
-  DBUG_RETURN(net_write_command(net,(uchar) 255, (uchar*) "", 0, (uchar*) buff,
-                                length));
+  /*
+    Ensure that errors are not compressed. This is to ensure we can
+    detect out of bands error messages in the client
+  */
+  if ((save_compress= net->compress))
+    net->compress= 2;
+  ret= net_write_command(net,(uchar) 255, (uchar*) "", 0, (uchar*) buff,
+                         length);
+  net->compress= save_compress;
+  DBUG_RETURN(ret);
 }
 
 #endif /* EMBEDDED_LIBRARY */
@@ -1248,7 +1256,7 @@ bool Protocol_text::send_out_parameters(List<Item_param> *sp_params)
       continue; // It's an IN-parameter.
 
     Item_func_set_user_var *suv=
-      new Item_func_set_user_var(*user_var_name, item_param);
+      new (thd->mem_root) Item_func_set_user_var(thd, *user_var_name, item_param);
     /*
       Item_func_set_user_var is not fixed after construction, call
       fix_fields().
@@ -1520,7 +1528,7 @@ bool Protocol_binary::send_out_parameters(List<Item_param> *sp_params)
       if (!item_param->get_out_param_info())
         continue; // It's an IN-parameter.
 
-      if (out_param_lst.push_back(item_param))
+      if (out_param_lst.push_back(item_param, thd->mem_root))
         return TRUE;
     }
   }

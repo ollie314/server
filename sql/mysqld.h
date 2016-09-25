@@ -1,4 +1,5 @@
-/* Copyright (c) 2006, 2013, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2006, 2016, Oracle and/or its affiliates.
+   Copyright (c) 2010, 2016, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -39,6 +40,8 @@ typedef struct st_mysql_show_var SHOW_VAR;
 
 #if MAX_INDEXES <= 64
 typedef Bitmap<64>  key_map;          /* Used for finding keys */
+#elif MAX_INDEXES > 128
+#error "MAX_INDEXES values greater than 128 is not supported."
 #else
 typedef Bitmap<((MAX_INDEXES+7)/8*8)> key_map; /* Used for finding keys */
 #endif
@@ -81,6 +84,7 @@ void close_connection(THD *thd, uint sql_errno= 0);
 void handle_connection_in_main_thread(THD *thd);
 void create_thread_to_handle_connection(THD *thd);
 void delete_running_thd(THD *thd);
+void signal_thd_deleted();
 void unlink_thd(THD *thd);
 bool one_thread_per_connection_end(THD *thd, bool put_in_cache);
 void flush_thread_cache();
@@ -254,6 +258,7 @@ extern ulong connection_errors_internal;
 extern ulong connection_errors_max_connection;
 extern ulong connection_errors_peer_addr;
 extern ulong log_warnings;
+extern my_bool encrypt_binlog;
 extern my_bool encrypt_tmp_disk_tables, encrypt_tmp_files;
 extern ulong encryption_algorithm;
 extern const char *encryption_algorithm_names[];
@@ -330,14 +335,14 @@ extern PSI_cond_key key_RELAYLOG_update_cond, key_COND_wakeup_ready,
 extern PSI_cond_key key_RELAYLOG_COND_queue_busy;
 extern PSI_cond_key key_TC_LOG_MMAP_COND_queue_busy;
 extern PSI_cond_key key_COND_rpl_thread, key_COND_rpl_thread_queue,
-  key_COND_rpl_thread_pool,
+  key_COND_rpl_thread_stop, key_COND_rpl_thread_pool,
   key_COND_parallel_entry, key_COND_group_commit_orderer;
 extern PSI_cond_key key_COND_wait_gtid, key_COND_gtid_ignore_duplicates;
 
 extern PSI_thread_key key_thread_bootstrap, key_thread_delayed_insert,
   key_thread_handle_manager, key_thread_kill_server, key_thread_main,
-  key_thread_one_connection, key_thread_signal_hand, key_thread_slave_init,
-  key_rpl_parallel_thread;
+  key_thread_one_connection, key_thread_signal_hand,
+  key_thread_slave_background, key_rpl_parallel_thread;
 
 extern PSI_file_key key_file_binlog, key_file_binlog_index, key_file_casetest,
   key_file_dbopt, key_file_des_key_file, key_file_ERRMSG, key_select_to_file,
@@ -469,11 +474,6 @@ extern PSI_stage_info stage_waiting_for_the_next_event_in_relay_log;
 extern PSI_stage_info stage_waiting_for_the_slave_thread_to_advance_position;
 extern PSI_stage_info stage_waiting_to_finalize_termination;
 extern PSI_stage_info stage_waiting_to_get_readlock;
-extern PSI_stage_info stage_slave_waiting_worker_to_release_partition;
-extern PSI_stage_info stage_slave_waiting_worker_to_free_events;
-extern PSI_stage_info stage_slave_waiting_worker_queue;
-extern PSI_stage_info stage_slave_waiting_event_from_coordinator;
-extern PSI_stage_info stage_slave_waiting_workers_to_exit;
 extern PSI_stage_info stage_binlog_waiting_background_tasks;
 extern PSI_stage_info stage_binlog_processing_checkpoint_notify;
 extern PSI_stage_info stage_binlog_stopping_background_thread;
@@ -482,9 +482,15 @@ extern PSI_stage_info stage_waiting_for_prior_transaction_to_commit;
 extern PSI_stage_info stage_waiting_for_prior_transaction_to_start_commit;
 extern PSI_stage_info stage_waiting_for_room_in_worker_thread;
 extern PSI_stage_info stage_waiting_for_workers_idle;
+extern PSI_stage_info stage_waiting_for_ftwrl;
+extern PSI_stage_info stage_waiting_for_ftwrl_threads_to_pause;
+extern PSI_stage_info stage_waiting_for_rpl_thread_pool;
 extern PSI_stage_info stage_master_gtid_wait_primary;
 extern PSI_stage_info stage_master_gtid_wait;
 extern PSI_stage_info stage_gtid_wait_other_connection;
+extern PSI_stage_info stage_slave_background_process_request;
+extern PSI_stage_info stage_slave_background_wait_request;
+extern PSI_stage_info stage_waiting_for_deadlock_kill;
 
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
 /**
@@ -553,9 +559,10 @@ extern mysql_mutex_t
        LOCK_slave_list, LOCK_active_mi, LOCK_manager,
        LOCK_global_system_variables, LOCK_user_conn,
        LOCK_prepared_stmt_count, LOCK_error_messages, LOCK_connection_count,
-       LOCK_slave_init;
+       LOCK_slave_background;
 extern MYSQL_PLUGIN_IMPORT mysql_mutex_t LOCK_thread_count;
 #ifdef HAVE_OPENSSL
+extern char* des_key_file;
 extern mysql_mutex_t LOCK_des_key_file;
 #endif
 extern mysql_mutex_t LOCK_server_started;
@@ -564,9 +571,9 @@ extern mysql_rwlock_t LOCK_grant, LOCK_sys_init_connect, LOCK_sys_init_slave;
 extern mysql_rwlock_t LOCK_system_variables_hash;
 extern mysql_cond_t COND_thread_count;
 extern mysql_cond_t COND_manager;
-extern mysql_cond_t COND_slave_init;
+extern mysql_cond_t COND_slave_background;
 extern int32 thread_running;
-extern int32 thread_count;
+extern int32 thread_count, service_thread_count;
 
 extern char *opt_ssl_ca, *opt_ssl_capath, *opt_ssl_cert, *opt_ssl_cipher,
   *opt_ssl_key, *opt_ssl_crl, *opt_ssl_crlpath;
@@ -614,6 +621,7 @@ enum options_mysqld
   OPT_REPLICATE_WILD_IGNORE_TABLE,
   OPT_SAFE,
   OPT_SERVER_ID,
+  OPT_SILENT,
   OPT_SKIP_HOST_CACHE,
   OPT_SKIP_RESOLVE,
   OPT_SLAVE_PARALLEL_MODE,
@@ -626,6 +634,10 @@ enum options_mysqld
   OPT_SSL_KEY,
   OPT_THREAD_CONCURRENCY,
   OPT_WANT_CORE,
+#ifdef WITH_WSREP
+  OPT_WSREP_CAUSAL_READS,
+  OPT_WSREP_SYNC_WAIT,
+#endif /* WITH_WSREP */
   OPT_MYSQL_COMPATIBILITY,
   OPT_MYSQL_TO_BE_IMPLEMENTED,
   OPT_which_is_always_the_last
@@ -645,10 +657,41 @@ enum enum_query_type
   QT_WITHOUT_INTRODUCERS= (1 << 1),
   /// view internal representation (like QT_ORDINARY except ORDER BY clause)
   QT_VIEW_INTERNAL= (1 << 2),
-  /// This value means focus on readability, not on ability to parse back, etc.
-  QT_EXPLAIN= (1 << 4)
-};
+  /// If identifiers should not include database names for the current database
+  QT_ITEM_IDENT_SKIP_CURRENT_DATABASE= (1 << 3),
+  /// If Item_cache_wrapper should not print <expr_cache>
+  QT_ITEM_CACHE_WRAPPER_SKIP_DETAILS= (1 << 4),
+  /// If Item_subselect should print as just "(subquery#1)"
+  /// rather than display the subquery body
+  QT_ITEM_SUBSELECT_ID_ONLY= (1 << 5),
+  /// If NULLIF(a,b) should print itself as
+  /// CASE WHEN a_for_comparison=b THEN NULL ELSE a_for_return_value END
+  /// when "a" was replaced to two different items
+  /// (e.g. by equal fields propagation in optimize_cond())
+  /// or always as NULLIF(a, b).
+  /// The default behaviour is to use CASE syntax when
+  /// a_for_return_value is not the same as a_for_comparison.
+  /// SHOW CREATE {VIEW|PROCEDURE|FUNCTION} and other cases where the
+  /// original representation is required, should set this flag.
+  QT_ITEM_ORIGINAL_FUNC_NULLIF= (1 <<6),
 
+  /// This value means focus on readability, not on ability to parse back, etc.
+  QT_EXPLAIN=           QT_TO_SYSTEM_CHARSET |
+                        QT_ITEM_IDENT_SKIP_CURRENT_DATABASE |
+                        QT_ITEM_CACHE_WRAPPER_SKIP_DETAILS |
+                        QT_ITEM_SUBSELECT_ID_ONLY,
+
+  /// This is used for EXPLAIN EXTENDED extra warnings
+  /// Be more detailed than QT_EXPLAIN.
+  /// Perhaps we should eventually include QT_ITEM_IDENT_SKIP_CURRENT_DATABASE
+  /// here, as it would give better readable results
+  QT_EXPLAIN_EXTENDED=  QT_TO_SYSTEM_CHARSET,
+
+  // If an expression is constant, print the expression, not the value
+  // it evaluates to. Should be used for error messages, so that they
+  // don't reveal values.
+  QT_NO_DATA_EXPANSION= (1 << 9),
+};
 
 
 /* query_id */
@@ -756,10 +799,11 @@ extern ulong thread_created;
 extern scheduler_functions *thread_scheduler, *extra_thread_scheduler;
 extern char *opt_log_basename;
 extern my_bool opt_master_verify_checksum;
-extern my_bool opt_stack_trace;
+extern my_bool opt_stack_trace, disable_log_notes;
 extern my_bool opt_expect_abort;
 extern my_bool opt_slave_sql_verify_checksum;
 extern my_bool opt_mysql56_temporal_format, strict_password_validation;
+extern my_bool opt_explicit_defaults_for_timestamp;
 extern ulong binlog_checksum_options;
 extern bool max_user_connections_checking;
 extern ulong opt_binlog_dbug_fsync_sleep;

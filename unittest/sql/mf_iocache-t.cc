@@ -21,7 +21,7 @@
 #define KEY_SIZE (128/8)
 
 my_bool encrypt_tmp_files;
-void init_io_cache_encryption();
+int init_io_cache_encryption();
 
 uint encryption_key_get_latest_version_func(uint)
 {
@@ -49,22 +49,41 @@ uint encryption_key_get_func(uint, uint, uchar* key, uint* size)
   return 0;
 }
 
+#ifdef HAVE_EncryptAes128Gcm
+enum my_aes_mode aes_mode= MY_AES_GCM;
+#else
+enum my_aes_mode aes_mode= MY_AES_CBC;
+#endif
+
+int encryption_ctx_init_func(void *ctx, const unsigned char* key, unsigned int klen,
+                                const unsigned char* iv, unsigned int ivlen,
+                                int flags, unsigned int key_id,
+                                unsigned int key_version)
+{
+  return my_aes_crypt_init(ctx, aes_mode, flags, key, klen, iv, ivlen);
+}
+
+uint encryption_encrypted_length_func(unsigned int slen, unsigned int key_id, unsigned int key_version)
+{
+  return my_aes_get_size(aes_mode, slen);
+}
+
 struct encryption_service_st encryption_handler=
 {
   encryption_key_get_latest_version_func,
-  encryption_key_id_exists_func,
-  encryption_key_version_exists_func,
   encryption_key_get_func,
-#ifdef HAVE_EncryptAes128Gcm
-  (encrypt_decrypt_func)my_aes_encrypt_gcm,
-  (encrypt_decrypt_func)my_aes_decrypt_gcm
-#else
-  (encrypt_decrypt_func)my_aes_encrypt_cbc,
-  (encrypt_decrypt_func)my_aes_decrypt_cbc
-#endif
+  (uint (*)(unsigned int, unsigned int))my_aes_ctx_size,
+  encryption_ctx_init_func,
+  my_aes_crypt_update,
+  my_aes_crypt_finish,
+  encryption_encrypted_length_func
 };
 
-void sql_print_information(const char *format, ...) 
+void sql_print_information(const char *format, ...)
+{
+}
+
+void sql_print_error(const char *format, ...)
 {
 }
 
@@ -93,6 +112,8 @@ void temp_io_cache()
   uchar buf[CACHE_SIZE + 200];
   memset(buf, FILL, sizeof(buf));
 
+  diag("temp io_cache with%s encryption", encrypt_tmp_files?"":"out");
+
   init_io_cache_encryption();  
   
   res= open_cached_file(&info, 0, 0, CACHE_SIZE, 0);
@@ -118,7 +139,7 @@ void temp_io_cache()
 
   res= my_pread(info.file, buf, 50, 50, MYF(MY_NABP));
   ok(res == 0 && data_bad(buf, 50) == encrypt_tmp_files,
-     "check encryption, file must be %sreadable", encrypt_tmp_files ?"un":"");
+     "file must be %sreadable", encrypt_tmp_files ?"un":"");
 
   res= my_b_read(&info, buf, 50) || data_bad(buf, 50);
   ok(res == 0 && info.pos_in_file == 0, "small read" INFO_TAIL);
@@ -129,17 +150,57 @@ void temp_io_cache()
   close_cached_file(&info);
 }
 
+void mdev9044()
+{
+  int res;
+  uchar buf[CACHE_SIZE + 200];
+
+  diag("MDEV-9044 Binlog corruption in Galera");
+
+  res= open_cached_file(&info, 0, 0, CACHE_SIZE, 0);
+  ok(res == 0, "open_cached_file" INFO_TAIL);
+
+  res= my_b_write(&info, USTRING_WITH_LEN("first write\0"));
+  ok(res == 0, "first write" INFO_TAIL);
+
+  res= my_b_flush_io_cache(&info, 1);
+  ok(res == 0, "flush" INFO_TAIL);
+
+  res= reinit_io_cache(&info, WRITE_CACHE, 0, 0, 0);
+  ok(res == 0, "reinit WRITE_CACHE" INFO_TAIL);
+
+  res= my_b_write(&info, USTRING_WITH_LEN("second write\0"));
+  ok(res == 0, "second write" INFO_TAIL );
+
+  res= reinit_io_cache(&info, READ_CACHE, 0, 0, 0);
+  ok(res == 0, "reinit READ_CACHE" INFO_TAIL);
+
+  res= my_b_fill(&info);
+  ok(res == 0, "fill" INFO_TAIL);
+
+  res= reinit_io_cache(&info, READ_CACHE, 0, 0, 0);
+  ok(res == 0, "reinit READ_CACHE" INFO_TAIL);
+
+  res= my_b_read(&info, buf, sizeof(buf));
+  ok(res == 1 && strcmp((char*)buf, "second write") == 0, "read '%s'", buf);
+
+  close_cached_file(&info);
+}
+
 int main(int argc __attribute__((unused)),char *argv[])
 {
   MY_INIT(argv[0]);
-  plan(20);
+  plan(29);
 
-  /* temp files */
+  /* temp files with and without encryption */
+  encrypt_tmp_files= 1;
+  temp_io_cache();
+
   encrypt_tmp_files= 0;
   temp_io_cache();
 
-  encrypt_tmp_files= 1;
-  temp_io_cache();
+  /* regression tests */
+  mdev9044();
 
   my_end(0);
   return exit_status();

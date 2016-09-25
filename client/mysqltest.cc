@@ -1,5 +1,5 @@
 /* Copyright (c) 2000, 2013, Oracle and/or its affiliates.
-   Copyright (c) 2009, 2013, Monty Program Ab.
+   Copyright (c) 2009, 2016, Monty Program Ab.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -33,7 +33,7 @@
   And many others
 */
 
-#define MTEST_VERSION "3.4"
+#define MTEST_VERSION "3.5"
 
 #include "client_priv.h"
 #include <mysql_version.h>
@@ -181,6 +181,7 @@ static uint my_end_arg= 0;
 static uint opt_tail_lines= 0;
 
 static uint opt_connect_timeout= 0;
+static uint opt_wait_for_pos_timeout= 0;
 
 static char delimiter[MAX_DELIMITER_LENGTH]= ";";
 static uint delimiter_length= 1;
@@ -1104,7 +1105,7 @@ void do_eval(DYNAMIC_STRING *query_eval, const char *query,
   Run query and dump the result to stderr in vertical format
 
   NOTE! This function should be safe to call when an error
-  has occured and thus any further errors will be ignored(although logged)
+  has occurred and thus any further errors will be ignored (although logged)
 
   SYNOPSIS
   show_query
@@ -1170,7 +1171,7 @@ static void show_query(MYSQL* mysql, const char* query)
   is added to the warning stack, only print @@warning_count-1 warnings.
 
   NOTE! This function should be safe to call when an error
-  has occured and this any further errors will be ignored(although logged)
+  has occurred and this any further errors will be ignored(although logged)
 
   SYNOPSIS
   show_warnings_before_error
@@ -4657,7 +4658,7 @@ void do_sync_with_master2(struct st_command *command, long offset,
   MYSQL_ROW row;
   MYSQL *mysql= cur_con->mysql;
   char query_buf[FN_REFLEN+128];
-  int timeout= 300; /* seconds */
+  int timeout= opt_wait_for_pos_timeout;
 
   if (!master_pos.file[0])
     die("Calling 'sync_with_master' without calling 'save_master_pos'");
@@ -4699,7 +4700,7 @@ void do_sync_with_master2(struct st_command *command, long offset,
         master_pos_wait returned NULL. This indicates that
         slave SQL thread is not started, the slave's master
         information is not initialized, the arguments are
-        incorrect, or an error has occured
+        incorrect, or an error has occurred
       */
       die("%.*s failed: '%s' returned NULL "          \
           "indicating slave SQL thread failure",
@@ -4977,12 +4978,13 @@ static int my_kill(int pid, int sig)
 {
 #ifdef __WIN__
   HANDLE proc;
-  if ((proc= OpenProcess(PROCESS_TERMINATE, FALSE, pid)) == NULL)
+  if ((proc= OpenProcess(SYNCHRONIZE|PROCESS_TERMINATE, FALSE, pid)) == NULL)
     return -1;
   if (sig == 0)
   {
+    DWORD wait_result= WaitForSingleObject(proc, 0);
     CloseHandle(proc);
-    return 0;
+    return wait_result == WAIT_OBJECT_0?-1:0;
   }
   (void)TerminateProcess(proc, 201);
   CloseHandle(proc);
@@ -5011,7 +5013,7 @@ static int my_kill(int pid, int sig)
 
 void do_shutdown_server(struct st_command *command)
 {
-  long timeout=60;
+  long timeout= opt_wait_for_pos_timeout ? opt_wait_for_pos_timeout / 5 : 300;
   int pid;
   DYNAMIC_STRING ds_pidfile_name;
   MYSQL* mysql = cur_con->mysql;
@@ -5080,7 +5082,6 @@ void do_shutdown_server(struct st_command *command)
   (void)my_kill(pid, 9);
 
   DBUG_VOID_RETURN;
-
 }
 
 
@@ -5102,7 +5103,7 @@ static st_error global_error_names[] =
 #include <my_base.h>
 static st_error handler_error_names[] =
 {
-  { "<No error>", -1U, "" },
+  { "<No error>", UINT_MAX, "" },
 #include <handler_ername.h>
   { 0, 0, 0 }
 };
@@ -6953,6 +6954,10 @@ static struct my_option my_long_options[] =
    "Number of seconds before connection timeout.",
    &opt_connect_timeout, &opt_connect_timeout, 0, GET_UINT, REQUIRED_ARG,
    120, 0, 3600 * 12, 0, 0, 0},
+  {"wait_for_pos_timeout", 0,
+   "Number of seconds to wait for master_pos_wait",
+   &opt_wait_for_pos_timeout, &opt_wait_for_pos_timeout, 0, GET_UINT,
+   REQUIRED_ARG, 300, 0, 3600 * 12, 0, 0, 0},
   {"plugin_dir", 0, "Directory for client-side plugins.",
     &opt_plugin_dir, &opt_plugin_dir, 0,
    GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},

@@ -63,7 +63,7 @@ wsrep_prepend_PATH (const char* path)
         size_t const new_path_len(strlen(old_path) + strlen(":") +
                                   strlen(path) + 1);
 
-        char* const new_path (reinterpret_cast<char*>(malloc(new_path_len)));
+        char* const new_path (static_cast<char*>(malloc(new_path_len)));
 
         if (new_path)
         {
@@ -89,6 +89,90 @@ wsrep_prepend_PATH (const char* path)
 namespace wsp
 {
 
+bool
+env::ctor_common(char** e)
+{
+    env_ = static_cast<char**>(malloc((len_ + 1) * sizeof(char*)));
+
+    if (env_)
+    {
+        for (size_t i(0); i < len_; ++i)
+        {
+            assert(e[i]); // caller should make sure about len_
+            env_[i] = strdup(e[i]);
+            if (!env_[i])
+            {
+                errno_ = errno;
+                WSREP_ERROR("Failed to allocate env. var: %s", e[i]);
+                return true;
+            }
+        }
+
+        env_[len_] = NULL;
+        return false;
+    }
+    else
+    {
+        errno_ = errno;
+        WSREP_ERROR("Failed to allocate env. var vector of length: %zu", len_);
+        return true;
+    }
+}
+
+void
+env::dtor()
+{
+    if (env_)
+    {
+        /* don't need to go beyond the first NULL */
+        for (size_t i(0); env_[i] != NULL; ++i) { free(env_[i]); }
+        free(env_);
+        env_ = NULL;
+    }
+    len_ = 0;
+}
+
+env::env(char** e)
+    : len_(0), env_(NULL), errno_(0)
+{
+    if (!e) { e = environ; }
+    /* count the size of the vector */
+    while (e[len_]) { ++len_; }
+
+    if (ctor_common(e)) dtor();
+}
+
+env::env(const env& e)
+    : len_(e.len_), env_(0), errno_(0)
+{
+    if (ctor_common(e.env_)) dtor();
+}
+
+env::~env() { dtor(); }
+
+int
+env::append(const char* val)
+{
+    char** tmp = static_cast<char**>(realloc(env_, (len_ + 2)*sizeof(char*)));
+
+    if (tmp)
+    {
+        env_ = tmp;
+        env_[len_] = strdup(val);
+
+        if (env_[len_])
+        {
+            ++len_;
+            env_[len_] = NULL;
+        }
+        else errno_ = errno;
+    }
+    else errno_ = errno;
+
+    return errno_;
+}
+
+
 #define PIPE_READ  0
 #define PIPE_WRITE 1
 #define STDIN_FD   0
@@ -98,7 +182,7 @@ namespace wsp
 # define POSIX_SPAWN_USEVFORK 0
 #endif
 
-process::process (const char* cmd, const char* type)
+process::process (const char* cmd, const char* type, char** env)
     : str_(cmd ? strdup(cmd) : strdup("")), io_(NULL), err_(EINVAL), pid_(0)
 {
     if (0 == str_)
@@ -119,6 +203,8 @@ process::process (const char* cmd, const char* type)
         WSREP_ERROR ("type argument should be either \"r\" or \"w\".");
         return;
     }
+
+    if (NULL == env) { env = environ; } // default to global environment
 
     int pipe_fds[2] = { -1, };
     if (::pipe(pipe_fds))
@@ -215,7 +301,7 @@ process::process (const char* cmd, const char* type)
         goto cleanup_fact;
     }
 
-    err_ = posix_spawnp (&pid_, pargv[0], &fact, &attr, pargv, environ);
+    err_ = posix_spawnp (&pid_, pargv[0], &fact, &attr, pargv, env);
     if (err_)
     {
         WSREP_ERROR ("posix_spawnp(%s) failed: %d (%s)",
@@ -309,6 +395,7 @@ process::wait ()
               {
               case 126: err_ = EACCES; break; /* Permission denied */
               case 127: err_ = ENOENT; break; /* No such file or directory */
+              case 143: err_ = EINTR;  break; /* Subprocess killed */
               }
               WSREP_ERROR("Process completed with error: %s: %d (%s)",
                           str_, err_, strerror(err_));
@@ -352,7 +439,7 @@ thd::~thd ()
 } // namespace wsp
 
 /* Returns INADDR_NONE, INADDR_ANY, INADDR_LOOPBACK or something else */
-unsigned int wsrep_check_ip (const char* const addr)
+unsigned int wsrep_check_ip (const char* const addr, bool *is_ipv6)
 {
   unsigned int ret = INADDR_NONE;
   struct addrinfo *res, hints;
@@ -361,6 +448,8 @@ unsigned int wsrep_check_ip (const char* const addr)
   hints.ai_flags= AI_PASSIVE/*|AI_ADDRCONFIG*/;
   hints.ai_socktype= SOCK_STREAM;
   hints.ai_family= AF_UNSPEC;
+
+  *is_ipv6= false;
 
   int gai_ret = getaddrinfo(addr, NULL, &hints, &res);
   if (0 == gai_ret)
@@ -379,6 +468,8 @@ unsigned int wsrep_check_ip (const char* const addr)
         ret= INADDR_LOOPBACK;
       else
         ret= 0xdeadbeef;
+
+      *is_ipv6= true;
     }
     freeaddrinfo (res);
   }
@@ -387,10 +478,6 @@ unsigned int wsrep_check_ip (const char* const addr)
                  addr, gai_ret, gai_strerror(gai_ret));
   }
 
-  // uint8_t* b= (uint8_t*)&ret;
-  // fprintf (stderr, "########## wsrep_check_ip returning: %hhu.%hhu.%hhu.%hhu\n",
-  //          b[0], b[1], b[2], b[3]);
-
   return ret;
 }
 
@@ -398,44 +485,48 @@ extern char* my_bind_addr_str;
 
 size_t wsrep_guess_ip (char* buf, size_t buf_len)
 {
-  size_t ip_len = 0;
+  size_t ret= 0;
 
+  // Attempt 1: Try to get the IP from bind-address.
   if (my_bind_addr_str && my_bind_addr_str[0] != '\0')
   {
-    unsigned int const ip_type= wsrep_check_ip(my_bind_addr_str);
+    bool unused;
+    unsigned int const ip_type= wsrep_check_ip(my_bind_addr_str, &unused);
 
     if (INADDR_NONE == ip_type) {
       WSREP_ERROR("Networking not configured, cannot receive state "
                   "transfer.");
-      return 0;
-    }
-
-    if (INADDR_ANY != ip_type) {
+      ret= 0;
+      goto done;
+    } else if (INADDR_ANY != ip_type) {
       strncpy (buf, my_bind_addr_str, buf_len);
-      return strlen(buf);
+      ret= strlen(buf);
+      goto done;
     }
   }
 
-  // mysqld binds to all interfaces - try IP from wsrep_node_address
+  // Attempt 2: mysqld binds to all interfaces, try IP from wsrep_node_address.
   if (wsrep_node_address && wsrep_node_address[0] != '\0') {
-    const char* const colon_ptr = strchr(wsrep_node_address, ':');
-
-    if (colon_ptr)
-      ip_len = colon_ptr - wsrep_node_address;
-    else
-      ip_len = strlen(wsrep_node_address);
-
-    if (ip_len >= buf_len) {
-      WSREP_WARN("default_ip(): buffer too short: %zu <= %zd", buf_len, ip_len);
-      return 0;
+    wsp::Address addr(wsrep_node_address);
+    if (!addr.is_valid())
+    {
+      WSREP_WARN("Could not parse wsrep_node_address : %s",
+                 wsrep_node_address);
+      ret= 0;
+      goto done;
     }
 
-    memcpy (buf, wsrep_node_address, ip_len);
-    buf[ip_len] = '\0';
-    return ip_len;
+    /* Safety check: Buffer length should be sufficiently large. */
+    DBUG_ASSERT(buf_len >= addr.get_address_len());
+
+    memcpy(buf, addr.get_address(), addr.get_address_len());
+    ret= addr.get_address_len();
+    goto done;
   }
 
   /*
+    Attempt 3: Try to get the IP from the list of available interfaces.
+
     getifaddrs() is avaiable at least on Linux since glib 2.3, FreeBSD,
     MAC OSX, OpenSolaris, Solaris.
 
@@ -444,26 +535,42 @@ size_t wsrep_guess_ip (char* buf, size_t buf_len)
   */
 #if HAVE_GETIFADDRS
   struct ifaddrs *ifaddr, *ifa;
+  int family;
+
   if (getifaddrs(&ifaddr) == 0)
   {
     for (ifa= ifaddr; ifa != NULL; ifa = ifa->ifa_next)
     {
-      if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) // TODO AF_INET6
+      if (!ifa->ifa_addr)
+        continue;
+
+      family= ifa->ifa_addr->sa_family;
+
+      if ((family != AF_INET) && (family != AF_INET6))
         continue;
 
       // Skip loopback interfaces (like lo:127.0.0.1)
       if (ifa->ifa_flags & IFF_LOOPBACK)
         continue;
 
+      /*
+        Get IP address from the socket address. The resulting address may have
+        zone ID appended for IPv6 addresses (<address>%<zone-id>).
+      */
       if (vio_getnameinfo(ifa->ifa_addr, buf, buf_len, NULL, 0, NI_NUMERICHOST))
         continue;
 
       freeifaddrs(ifaddr);
-      return strlen(buf);
+
+      ret= strlen(buf);
+      goto done;
     }
     freeifaddrs(ifaddr);
   }
 #endif /* HAVE_GETIFADDRS */
 
-  return 0;
+done:
+  WSREP_DEBUG("wsrep_guess_ip() : %s", (ret > 0) ? buf : "????");
+  return ret;
 }
+

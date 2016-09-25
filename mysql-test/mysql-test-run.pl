@@ -284,7 +284,6 @@ my $opt_port_base= $ENV{'MTR_PORT_BASE'} || "auto";
 my $build_thread= 0;
 
 my $opt_record;
-my $opt_report_features;
 
 our $opt_resfile= $ENV{'MTR_RESULT_FILE'} || 0;
 
@@ -317,7 +316,6 @@ our $opt_user = "root";
 our $opt_valgrind= 0;
 my $opt_valgrind_mysqld= 0;
 my $opt_valgrind_mysqltest= 0;
-my @default_valgrind_args= ("--show-reachable=yes");
 my @valgrind_args;
 my $opt_strace= 0;
 my $opt_strace_client;
@@ -352,8 +350,10 @@ my $source_dist=  -d "../sql";
 my $opt_max_save_core= env_or_val(MTR_MAX_SAVE_CORE => 5);
 my $opt_max_save_datadir= env_or_val(MTR_MAX_SAVE_DATADIR => 20);
 my $opt_max_test_fail= env_or_val(MTR_MAX_TEST_FAIL => 10);
+my $opt_core_on_failure= 0;
 
 my $opt_parallel= $ENV{MTR_PARALLEL} || 1;
+my $opt_port_group_size = $ENV{MTR_PORT_GROUP_SIZE} || 20;
 
 # lock file to stop tests
 my $opt_stop_file= $ENV{MTR_STOP_FILE};
@@ -426,21 +426,6 @@ sub main {
       print $_->fullname(), "\n";
     }
     exit 0;
-  }
-
-  if ( $opt_report_features ) {
-    # Put "report features" as the first test to run
-    my $tinfo = My::Test->new
-      (
-       name           => 'report_features',
-       # No result_file => Prints result
-       path           => 'include/report-features.test',
-       template_path  => "include/default_my.cnf",
-       master_opt     => [],
-       slave_opt      => [],
-       suite          => 'main',
-      );
-    unshift(@$tests, $tinfo);
   }
 
   #######################################################################
@@ -1060,7 +1045,6 @@ sub print_global_resfile {
   resfile_global("shutdown-timeout", $opt_shutdown_timeout ? 1 : 0);
   resfile_global("warnings", $opt_warnings ? 1 : 0);
   resfile_global("max-connections", $opt_max_connections);
-#  resfile_global("default-myisam", $opt_default_myisam ? 1 : 0);
   resfile_global("product", "MySQL");
   # Somewhat hacky code to convert numeric version back to dot notation
   my $v1= int($mysql_version_id / 10000);
@@ -1117,6 +1101,7 @@ sub command_line_setup {
              # Specify ports
 	     'build-thread|mtr-build-thread=i' => \$opt_build_thread,
 	     'port-base|mtr-port-base=i'       => \$opt_port_base,
+	     'port-group-size=s'        => \$opt_port_group_size,
 
              # Test case authoring
              'record'                   => \$opt_record,
@@ -1156,6 +1141,7 @@ sub command_line_setup {
              'max-save-core=i'          => \$opt_max_save_core,
              'max-save-datadir=i'       => \$opt_max_save_datadir,
              'max-test-fail=i'          => \$opt_max_test_fail,
+             'core-on-failure'          => \$opt_core_on_failure,
 
              # Coverage, profiling etc
              'gcov'                     => \$opt_gcov,
@@ -1189,7 +1175,6 @@ sub command_line_setup {
              'client-libdir=s'          => \$path_client_libdir,
 
              # Misc
-             'report-features'          => \$opt_report_features,
              'comment=s'                => \$opt_comment,
              'fast'                     => \$opt_fast,
 	     'force-restart'            => \$opt_force_restart,
@@ -1218,7 +1203,6 @@ sub command_line_setup {
              'stop-file=s'              => \$opt_stop_file,
              'stop-keep-alive=i'        => \$opt_stop_keep_alive,
 	     'max-connections=i'        => \$opt_max_connections,
-	     'default-myisam!'          => \&collect_option,
 	     'report-times'             => \$opt_report_times,
 	     'result-file'              => \$opt_resfile,
 	     'stress=s'                 => \$opt_stress,
@@ -1722,16 +1706,26 @@ sub command_line_setup {
     # Set special valgrind options unless options passed on command line
     push(@valgrind_args, "--trace-children=yes")
       unless @valgrind_args;
+    unshift(@valgrind_args, "--tool=callgrind");
+  }
+
+  # default to --tool=memcheck
+  if ($opt_valgrind && ! grep(/^--tool=/i, @valgrind_args))
+  {
+    # Set valgrind_option unless already defined
+    push(@valgrind_args, ("--show-reachable=yes", "--leak-check=yes",
+                          "--num-callers=16"))
+      unless @valgrind_args;
+    unshift(@valgrind_args, "--tool=memcheck");
   }
 
   if ( $opt_valgrind )
   {
-    # Set valgrind_options to default unless already defined
-    push(@valgrind_args, @default_valgrind_args)
-      unless @valgrind_args;
-
     # Make valgrind run in quiet mode so it only print errors
     push(@valgrind_args, "--quiet" );
+
+    push(@valgrind_args, "--suppressions=${glob_mysql_test_dir}/valgrind.supp")
+      if -f "$glob_mysql_test_dir/valgrind.supp";
 
     mtr_report("Running valgrind with options \"",
 	       join(" ", @valgrind_args), "\"");
@@ -1783,9 +1777,12 @@ sub set_build_thread_ports($) {
   if ( lc($opt_build_thread) eq 'auto' ) {
     my $found_free = 0;
     $build_thread = 300;	# Start attempts from here
+    my $build_thread_upper = $build_thread + ($opt_parallel > 1500
+                                              ? 3000
+                                              : 2 * $opt_parallel) + 300;
     while (! $found_free)
     {
-      $build_thread= mtr_get_unique_id($build_thread, 349);
+      $build_thread= mtr_get_unique_id($build_thread, $build_thread_upper);
       if ( !defined $build_thread ) {
         mtr_error("Could not get a unique build thread id");
       }
@@ -1808,16 +1805,16 @@ sub set_build_thread_ports($) {
   $ENV{MTR_BUILD_THREAD}= $build_thread;
 
   # Calculate baseport
-  $baseport= $build_thread * 20 + 10000;
-  if ( $baseport < 5001 or $baseport + 19 >= 32767 )
+  $baseport= $build_thread * $opt_port_group_size + 10000;
+  if ( $baseport < 5001 or $baseport + $opt_port_group_size >= 32767 )
   {
     mtr_error("MTR_BUILD_THREAD number results in a port",
               "outside 5001 - 32767",
-              "($baseport - $baseport + 19)");
+              "($baseport - $baseport + $opt_port_group_size)");
   }
 
   mtr_report("Using MTR_BUILD_THREAD $build_thread,",
-	     "with reserved ports $baseport..".($baseport+19));
+	     "with reserved ports $baseport..".($baseport+($opt_port_group_size-1)));
 
 }
 
@@ -2579,15 +2576,18 @@ sub setup_vardir() {
   {
     $plugindir="$opt_vardir/plugins";
     mkpath($plugindir);
-    if (IS_WINDOWS && !$opt_embedded_server)
+    if (IS_WINDOWS)
     {
-      for (<$bindir/storage/*$opt_vs_config/*.dll>,
-           <$bindir/plugin/*$opt_vs_config/*.dll>,
-           <$bindir/sql$opt_vs_config/*.dll>)
+      if (!$opt_embedded_server)
       {
-        my $pname=basename($_);
-        copy rel2abs($_), "$plugindir/$pname";
-        set_plugin_var($pname);
+        for (<$bindir/storage/*$opt_vs_config/*.dll>,
+             <$bindir/plugin/*$opt_vs_config/*.dll>,
+             <$bindir/sql$opt_vs_config/*.dll>)
+        {
+          my $pname=basename($_);
+          copy rel2abs($_), "$plugindir/$pname";
+          set_plugin_var($pname);
+        }
       }
     }
     else
@@ -2968,8 +2968,8 @@ sub kill_leftovers ($) {
 sub check_ports_free ($)
 {
   my $bthread= shift;
-  my $portbase = $bthread * 10 + 10000;
-  for ($portbase..$portbase+9){
+  my $portbase = $bthread * $opt_port_group_size + 10000;
+  for ($portbase..$portbase+($opt_port_group_size-1)){
     if (mtr_ping_port($_)){
       mtr_report(" - 'localhost:$_' was not free");
       return 0; # One port was not free
@@ -3219,7 +3219,7 @@ sub mysql_install_db {
 
   # Create mtr database
   mtr_tofile($bootstrap_sql_file,
-	     "CREATE DATABASE mtr;\n");
+	     "CREATE DATABASE mtr CHARSET=latin1;\n");
 
   # Add help tables and data for warning detection and supression
   mtr_tofile($bootstrap_sql_file,
@@ -3758,6 +3758,7 @@ sub run_testcase ($$) {
   my $print_freq=20;
 
   mtr_verbose("Running test:", $tinfo->{name});
+  $ENV{'MTR_TEST_NAME'} = $tinfo->{name};
   resfile_report_test($tinfo) if $opt_resfile;
 
   # Allow only alpanumerics pluss _ - + . in combination names,
@@ -4145,7 +4146,7 @@ sub run_testcase ($$) {
     }
 
     # Try to dump core for mysqltest and all servers
-    foreach my $proc ($test, started(all_servers())) 
+    foreach my $proc ($test, started(all_servers()))
     {
       mtr_print("Trying to dump core for $proc");
       if ($proc->dump_core())
@@ -4374,6 +4375,7 @@ sub extract_warning_lines ($$) {
      qr/InnoDB: Redo log crypto: Can't initialize to key version -1u/,
      qr/InnoDB: Dumping buffer pool.*/,
      qr/InnoDB: Buffer pool.*/,
+     qr/InnoDB: Warning: Writer thread is waiting this semaphore/,
      qr/Slave: Unknown table 't1' .* 1051/,
      qr/Slave SQL:.*(Internal MariaDB error code: [[:digit:]]+|Query:.*)/,
      qr/slave SQL thread aborted/,
@@ -4429,6 +4431,22 @@ sub extract_warning_lines ($$) {
      qr|InnoDB: Setting thread \d+ nice to \d+ failed, current nice \d+, errno 13|, # setpriority() fails under valgrind
      qr|Failed to setup SSL|,
      qr|SSL error: Failed to set ciphers to use|,
+     qr/Plugin 'InnoDB' will be forced to shutdown/,
+     qr|Could not increase number of max_open_files to more than|,
+     qr/InnoDB: Error table encrypted but encryption service not available.*/,
+     qr/InnoDB: Could not find a valid tablespace file for*/,
+     qr/InnoDB: Tablespace open failed for*/,
+     qr/InnoDB: Failed to find tablespace for table*/,
+     qr/InnoDB: Space */,
+     qr|InnoDB: You may have to recover from a backup|,
+     qr|InnoDB: It is also possible that your operatingsystem has corrupted its own file cache|,
+     qr|InnoDB: and rebooting your computer removes the error|,
+     qr|InnoDB: If the corrupt page is an index page you can also try to|,
+     qr|nnoDB: fix the corruption by dumping, dropping, and reimporting|,
+     qr|InnoDB: the corrupt table. You can use CHECK|,
+     qr|InnoDB: TABLE to scan your table for corruption|,
+     qr/InnoDB: See also */
+
     );
 
   my $matched_lines= [];
@@ -4813,7 +4831,9 @@ sub after_failure ($) {
 sub report_failure_and_restart ($) {
   my $tinfo= shift;
 
-  if ($opt_valgrind_mysqld && ($tinfo->{'warnings'} || $tinfo->{'timeout'})) {
+  if ($opt_valgrind_mysqld && ($tinfo->{'warnings'} || $tinfo->{'timeout'}) &&
+      $opt_core_on_failure == 0)
+  {
     # In these cases we may want valgrind report from normal termination
     $tinfo->{'dont_kill_server'}= 1;
   }
@@ -5461,6 +5481,13 @@ sub start_mysqltest ($) {
     mtr_add_arg($args, "--sleep=%d", $opt_sleep);
   }
 
+  if ( $opt_valgrind )
+  {
+    # We are running server under valgrind, which causes some replication
+    # test to be much slower, notable rpl_mdev6020.  Increase timeout.
+    mtr_add_arg($args, "--wait-for-pos-timeout=1500");
+  }
+
   if ( $opt_ssl )
   {
     # Turn on SSL for _all_ test cases if option --ssl was used
@@ -5790,29 +5817,15 @@ sub valgrind_arguments {
   my $args= shift;
   my $exe=  shift;
 
-  if ( $opt_callgrind)
+  # Ensure the jemalloc works with mysqld
+  if ($$exe =~ /mysqld/)
   {
-    mtr_add_arg($args, "--tool=callgrind");
-    mtr_add_arg($args, "--base=$opt_vardir/log");
-  }
-  else
-  {
-    mtr_add_arg($args, "--tool=memcheck"); # From >= 2.1.2 needs this option
-    mtr_add_arg($args, "--leak-check=yes");
-    mtr_add_arg($args, "--num-callers=16");
-    mtr_add_arg($args, "--suppressions=%s/valgrind.supp", $glob_mysql_test_dir)
-      if -f "$glob_mysql_test_dir/valgrind.supp";
-
-    # Ensure the jemalloc works with mysqld
-    if ($$exe =~ /mysqld/)
-    {
-      my %somalloc=(
-        'system jemalloc' => 'libjemalloc*',
-        'bundled jemalloc' => 'NONE'
-      );
-      my ($syn) = $somalloc{$mysqld_variables{'version-malloc-library'}};
-      mtr_add_arg($args, '--soname-synonyms=somalloc=%s', $syn) if $syn;
-    }
+    my %somalloc=(
+      'system jemalloc' => 'libjemalloc*',
+      'bundled jemalloc' => 'NONE'
+    );
+    my ($syn) = $somalloc{$mysqld_variables{'version-malloc-library'}};
+    mtr_add_arg($args, '--soname-synonyms=somalloc=%s', $syn) if $syn;
   }
 
   # Add valgrind options, can be overriden by user
@@ -5967,10 +5980,10 @@ Options to control what engine/variation to run:
   non-blocking-api      Use the non-blocking client API
   compress              Use the compressed protocol between client and server
   ssl                   Use ssl protocol between client and server
-  skip-ssl              Dont start server with support for ssl connections
+  skip-ssl              Don't start server with support for ssl connections
   vs-config             Visual Studio configuration used to create executables
                         (default: MTR_VS_CONFIG environment variable)
-  parallel=#            How many parallell test should be run
+  parallel=#            How many parallel test should be run
   defaults-file=<config template> Use fixed config template for all
                         tests
   defaults-extra-file=<config template> Extra config template to add to
@@ -6042,6 +6055,8 @@ Options that specify ports
   build-thread=#        Can be set in environment variable MTR_BUILD_THREAD.
                         Set  MTR_BUILD_THREAD="auto" to automatically aquire
                         a build thread id that is unique to current host
+  port-group-size=N     Reserve groups of TCP ports of size N for each MTR thread
+
 
 Options for test case authoring
 
@@ -6098,10 +6113,11 @@ Options for debugging the product
                         up disks for heavily crashing server). Defaults to
                         $opt_max_save_datadir, set to 0 for no limit. Set
                         it's default with MTR_MAX_SAVE_DATADIR
-  max-test-fail         Limit the number of test failurs before aborting
+  max-test-fail         Limit the number of test failures before aborting
                         the current test run. Defaults to
                         $opt_max_test_fail, set to 0 for no limit. Set
                         it's default with MTR_MAX_TEST_FAIL
+  core-in-failure	Generate a core even if run server is run with valgrind
 
 Options for valgrind
 
@@ -6145,7 +6161,7 @@ Misc options
                         --mysqld (if any)
   wait-all              If --start or --start-dirty option is used, wait for all
                         servers to exit before finishing the process
-  fast                  Run as fast as possible, dont't wait for servers
+  fast                  Run as fast as possible, don't wait for servers
                         to shutdown etc.
   parallel=N            Run tests in N parallel threads (default 1)
                         Use parallel=auto for auto-setting of N
@@ -6155,7 +6171,7 @@ Misc options
                         failures before stopping, set with the --retry-failure
                         option
   retry-failure=N       When using the --retry option to retry failed tests,
-                        stop when N failures have occured (default $opt_retry_failure)
+                        stop when N failures have occurred (default $opt_retry_failure)
   reorder               Reorder tests to get fewer server restarts
   help                  Get this help text
 
@@ -6179,20 +6195,16 @@ Misc options
                         actions. Disable facility with NUM=0.
   gcov                  Collect coverage information after the test.
                         The result is a gcov file per source and header file.
-  gcov-src-dir=subdir   Colllect coverage only within the given subdirectory.
+  gcov-src-dir=subdir   Collect coverage only within the given subdirectory.
                         For example, if you're only developing the SQL layer, 
                         it makes sense to use --gcov-src-dir=sql
   gprof                 Collect profiling information using gprof.
   experimental=<file>   Refer to list of tests considered experimental;
                         failures will be marked exp-fail instead of fail.
-  report-features       First run a "test" that reports mysql features
   timestamp             Print timestamp before each test report line
   timediff              With --timestamp, also print time passed since
                         *previous* test started
   max-connections=N     Max number of open connection to server in mysqltest
-  default-myisam        Set default storage engine to MyISAM for non-innodb
-                        tests. This is needed after switching default storage
-                        engine to InnoDB.
   report-times          Report how much time has been spent on different
                         phases of test execution.
   stress=ARGS           Run stress test, providing options to

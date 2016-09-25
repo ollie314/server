@@ -1,6 +1,6 @@
 /*
-   Copyright (c) 2002, 2013, Oracle and/or its affiliates.
-   Copyright (c) 2011, 2013, Monty Program Ab
+   Copyright (c) 2002, 2016, Oracle and/or its affiliates.
+   Copyright (c) 2011, 2016, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -534,8 +534,10 @@ sp_name::init_qname(THD *thd)
 bool
 check_routine_name(LEX_STRING *ident)
 {
-  if (!ident || !ident->str || !ident->str[0] ||
-      ident->str[ident->length-1] == ' ')
+  DBUG_ASSERT(ident);
+  DBUG_ASSERT(ident->str);
+
+  if (!ident->str[0] || ident->str[ident->length-1] == ' ')
   {
     my_error(ER_SP_WRONG_NAME, MYF(0), ident->str);
     return TRUE;
@@ -872,6 +874,7 @@ sp_head::create_result_field(uint field_max_length, const char *field_name,
                 field_max_length : m_return_field_def.length;
 
   field= ::make_field(table->s,                     /* TABLE_SHARE ptr */
+                      table->in_use->mem_root,
                       (uchar*) 0,                   /* field ptr */
                       field_length,                 /* field [max] length */
                       (uchar*) "",                  /* null ptr */
@@ -1129,7 +1132,7 @@ sp_head::execute(THD *thd, bool merge_da_on_success)
   const uint status_backup_mask= SERVER_STATUS_CURSOR_EXISTS |
                                  SERVER_STATUS_LAST_ROW_SENT;
   Reprepare_observer *save_reprepare_observer= thd->m_reprepare_observer;
-  Object_creation_ctx *saved_creation_ctx;
+  Object_creation_ctx *UNINIT_VAR(saved_creation_ctx);
   Diagnostics_area *da= thd->get_stmt_da();
   Warning_info sp_wi(da->warning_info_id(), false, true);
 
@@ -2019,7 +2022,7 @@ sp_head::execute_procedure(THD *thd, List<Item> *args)
 
       if (spvar->mode == sp_variable::MODE_OUT)
       {
-        Item_null *null_item= new Item_null();
+        Item_null *null_item= new (thd->mem_root) Item_null(thd);
         Item *tmp_item= null_item;
 
         if (!null_item ||
@@ -2531,6 +2534,69 @@ bool check_show_routine_access(THD *thd, sp_head *sp, bool *full_access)
 
 
 /**
+  Collect metadata for SHOW CREATE statement for stored routines.
+
+  @param thd  Thread context.
+  @param type         Stored routine type
+  @param type         Stored routine type
+                      (TYPE_ENUM_PROCEDURE or TYPE_ENUM_FUNCTION)
+
+  @return Error status.
+    @retval FALSE on success
+    @retval TRUE on error
+*/
+
+void
+sp_head::show_create_routine_get_fields(THD *thd, int type, List<Item> *fields)
+{
+  const char *col1_caption= type == TYPE_ENUM_PROCEDURE ?
+                            "Procedure" : "Function";
+
+  const char *col3_caption= type == TYPE_ENUM_PROCEDURE ?
+                            "Create Procedure" : "Create Function";
+
+  MEM_ROOT *mem_root= thd->mem_root;
+
+  /* Send header. */
+
+  fields->push_back(new (mem_root)
+                    Item_empty_string(thd, col1_caption, NAME_CHAR_LEN),
+                    mem_root);
+  fields->push_back(new (mem_root)
+                    Item_empty_string(thd, "sql_mode", 256),
+                    mem_root);
+
+  {
+    /*
+      NOTE: SQL statement field must be not less than 1024 in order not to
+      confuse old clients.
+    */
+
+    Item_empty_string *stmt_fld=
+      new (mem_root) Item_empty_string(thd, col3_caption, 1024);
+    stmt_fld->maybe_null= TRUE;
+
+    fields->push_back(stmt_fld, mem_root);
+  }
+
+  fields->push_back(new (mem_root)
+                   Item_empty_string(thd, "character_set_client",
+                                     MY_CS_NAME_SIZE),
+                   mem_root);
+
+  fields->push_back(new (mem_root)
+                   Item_empty_string(thd, "collation_connection",
+                                     MY_CS_NAME_SIZE),
+                   mem_root);
+
+  fields->push_back(new (mem_root)
+                   Item_empty_string(thd, "Database Collation",
+                                     MY_CS_NAME_SIZE),
+                   mem_root);
+}
+
+
+/**
   Implement SHOW CREATE statement for stored routines.
 
   @param thd  Thread context.
@@ -2559,6 +2625,7 @@ sp_head::show_create_routine(THD *thd, int type)
   LEX_STRING sql_mode;
 
   bool full_access;
+  MEM_ROOT *mem_root= thd->mem_root;
 
   DBUG_ENTER("sp_head::show_create_routine");
   DBUG_PRINT("info", ("routine %s", m_name.str));
@@ -2573,8 +2640,12 @@ sp_head::show_create_routine(THD *thd, int type)
 
   /* Send header. */
 
-  fields.push_back(new Item_empty_string(col1_caption, NAME_CHAR_LEN));
-  fields.push_back(new Item_empty_string("sql_mode", sql_mode.length));
+  fields.push_back(new (mem_root)
+                   Item_empty_string(thd, col1_caption, NAME_CHAR_LEN),
+                   thd->mem_root);
+  fields.push_back(new (mem_root)
+                   Item_empty_string(thd, "sql_mode", sql_mode.length),
+                   thd->mem_root);
 
   {
     /*
@@ -2583,22 +2654,28 @@ sp_head::show_create_routine(THD *thd, int type)
     */
 
     Item_empty_string *stmt_fld=
-      new Item_empty_string(col3_caption,
+      new (mem_root) Item_empty_string(thd, col3_caption,
                             MY_MAX(m_defstr.length, 1024));
 
     stmt_fld->maybe_null= TRUE;
 
-    fields.push_back(stmt_fld);
+    fields.push_back(stmt_fld, thd->mem_root);
   }
 
-  fields.push_back(new Item_empty_string("character_set_client",
-                                         MY_CS_NAME_SIZE));
+  fields.push_back(new (mem_root)
+                   Item_empty_string(thd, "character_set_client",
+                                     MY_CS_NAME_SIZE),
+                   thd->mem_root);
 
-  fields.push_back(new Item_empty_string("collation_connection",
-                                         MY_CS_NAME_SIZE));
+  fields.push_back(new (mem_root)
+                   Item_empty_string(thd, "collation_connection",
+                                     MY_CS_NAME_SIZE),
+                   thd->mem_root);
 
-  fields.push_back(new Item_empty_string("Database Collation",
-                                         MY_CS_NAME_SIZE));
+  fields.push_back(new (mem_root)
+                   Item_empty_string(thd, "Database Collation",
+                                     MY_CS_NAME_SIZE),
+                   thd->mem_root);
 
   if (protocol->send_result_set_metadata(&fields,
                             Protocol::SEND_NUM_ROWS | Protocol::SEND_EOF))
@@ -2781,10 +2858,13 @@ sp_head::show_routine_code(THD *thd)
   if (check_show_routine_access(thd, this, &full_access) || !full_access)
     DBUG_RETURN(1);
 
-  field_list.push_back(new Item_uint("Pos", 9));
+  field_list.push_back(new (thd->mem_root) Item_uint(thd, "Pos", 9),
+                       thd->mem_root);
   // 1024 is for not to confuse old clients
-  field_list.push_back(new Item_empty_string("Instruction",
-                                             MY_MAX(buffer.length(), 1024)));
+  field_list.push_back(new (thd->mem_root)
+                       Item_empty_string(thd, "Instruction",
+                                         MY_MAX(buffer.length(), 1024)),
+                       thd->mem_root);
   if (protocol->send_result_set_metadata(&field_list, Protocol::SEND_NUM_ROWS |
                                          Protocol::SEND_EOF))
     DBUG_RETURN(1);
@@ -3194,7 +3274,8 @@ sp_instr_set::print(String *str)
   }
   str->qs_append(m_offset);
   str->qs_append(' ');
-  m_value->print(str, QT_ORDINARY);
+  m_value->print(str, enum_query_type(QT_ORDINARY |
+                                      QT_ITEM_ORIGINAL_FUNC_NULLIF));
 }
 
 
@@ -3214,7 +3295,10 @@ sp_instr_set_trigger_field::execute(THD *thd, uint *nextp)
 int
 sp_instr_set_trigger_field::exec_core(THD *thd, uint *nextp)
 {
+  bool sav_abort_on_warning= thd->abort_on_warning;
+  thd->abort_on_warning= thd->is_strict_mode() && !thd->lex->ignore;
   const int res= (trigger_field->set_value(thd, &value) ? -1 : 0);
+  thd->abort_on_warning= sav_abort_on_warning;
   *nextp = m_ip+1;
   return res;
 }
@@ -3223,9 +3307,11 @@ void
 sp_instr_set_trigger_field::print(String *str)
 {
   str->append(STRING_WITH_LEN("set_trigger_field "));
-  trigger_field->print(str, QT_ORDINARY);
+  trigger_field->print(str, enum_query_type(QT_ORDINARY |
+                                            QT_ITEM_ORIGINAL_FUNC_NULLIF));
   str->append(STRING_WITH_LEN(":="));
-  value->print(str, QT_ORDINARY);
+  value->print(str, enum_query_type(QT_ORDINARY |
+                                    QT_ITEM_ORIGINAL_FUNC_NULLIF));
 }
 
 /*
@@ -3351,7 +3437,8 @@ sp_instr_jump_if_not::print(String *str)
   str->qs_append('(');
   str->qs_append(m_cont_dest);
   str->qs_append(STRING_WITH_LEN(") "));
-  m_expr->print(str, QT_ORDINARY);
+  m_expr->print(str, enum_query_type(QT_ORDINARY |
+                                     QT_ITEM_ORIGINAL_FUNC_NULLIF));
 }
 
 
@@ -3447,7 +3534,8 @@ sp_instr_freturn::print(String *str)
   str->qs_append(STRING_WITH_LEN("freturn "));
   str->qs_append((uint)m_type);
   str->qs_append(' ');
-  m_value->print(str, QT_ORDINARY);
+  m_value->print(str, enum_query_type(QT_ORDINARY |
+                                      QT_ITEM_ORIGINAL_FUNC_NULLIF));
 }
 
 /*
@@ -3893,7 +3981,7 @@ sp_instr_set_case_expr::exec_core(THD *thd, uint *nextp)
       initialized. Set to NULL so we can continue.
     */
 
-    Item *null_item= new Item_null();
+    Item *null_item= new (thd->mem_root) Item_null(thd);
 
     if (!null_item ||
         thd->spcont->set_case_expr(thd, m_case_expr_id, &null_item))
@@ -3919,7 +4007,8 @@ sp_instr_set_case_expr::print(String *str)
   str->qs_append(STRING_WITH_LEN(") "));
   str->qs_append(m_case_expr_id);
   str->qs_append(' ');
-  m_case_expr->print(str, QT_ORDINARY);
+  m_case_expr->print(str, enum_query_type(QT_ORDINARY |
+                                          QT_ITEM_ORIGINAL_FUNC_NULLIF));
 }
 
 uint

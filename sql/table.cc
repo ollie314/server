@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2014, Oracle and/or its affiliates.
+/* Copyright (c) 2000, 2015, Oracle and/or its affiliates.
    Copyright (c) 2008, 2015, MariaDB
 
    This program is free software; you can redistribute it and/or modify
@@ -19,7 +19,6 @@
 
 #include <my_global.h>                 /* NO_EMBEDDED_ACCESS_CHECKS */
 #include "sql_priv.h"
-#include "unireg.h"                    // REQUIRED: for other includes
 #include "table.h"
 #include "key.h"                                // find_ref_key
 #include "sql_table.h"                          // build_table_filename,
@@ -1657,7 +1656,7 @@ int TABLE_SHARE::init_from_binary_frm_image(THD *thd, bool write,
 #endif
 
     *field_ptr= reg_field=
-      make_field(share, record+recpos,
+      make_field(share, &share->mem_root, record+recpos,
 		 (uint32) field_length,
 		 null_pos, null_bit_pos,
 		 pack_flag,
@@ -1805,6 +1804,7 @@ int TABLE_SHARE::init_from_binary_frm_image(THD *thd, bool write,
       {
         KEY_PART_INFO *new_key_part= (keyinfo-1)->key_part +
                                      (keyinfo-1)->ext_key_parts;
+        uint add_keyparts_for_this_key= add_first_key_parts;
 
         /* 
           Do not extend the key that contains a component
@@ -1816,19 +1816,20 @@ int TABLE_SHARE::init_from_binary_frm_image(THD *thd, bool write,
           if (share->field[fieldnr-1]->key_length() !=
               keyinfo->key_part[i].length)
 	  {
-            add_first_key_parts= 0;
+            add_keyparts_for_this_key= 0;
             break;
           }
         }
 
-        if (add_first_key_parts < keyinfo->ext_key_parts-keyinfo->user_defined_key_parts)
+        if (add_keyparts_for_this_key < (keyinfo->ext_key_parts -
+                                        keyinfo->user_defined_key_parts))
 	{
           share->ext_key_parts-= keyinfo->ext_key_parts;
           key_part_map ext_key_part_map= keyinfo->ext_key_part_map;
           keyinfo->ext_key_parts= keyinfo->user_defined_key_parts;
           keyinfo->ext_key_flags= keyinfo->flags;
 	  keyinfo->ext_key_part_map= 0; 
-          for (i= 0; i < add_first_key_parts; i++)
+          for (i= 0; i < add_keyparts_for_this_key; i++)
 	  {
             if (ext_key_part_map & 1<<i)
 	    {
@@ -2585,7 +2586,7 @@ enum open_frm_error open_table_from_share(THD *thd, TABLE_SHARE *share,
                        bool is_create_table)
 {
   enum open_frm_error error;
-  uint records, i, bitmap_size;
+  uint records, i, bitmap_size, bitmap_count;
   bool error_reported= FALSE;
   uchar *record, *bitmaps;
   Field **field_ptr, **UNINIT_VAR(vfield_ptr), **UNINIT_VAR(dfield_ptr);
@@ -2617,6 +2618,7 @@ enum open_frm_error open_table_from_share(THD *thd, TABLE_SHARE *share,
   outparam->quick_keys.init();
   outparam->covering_keys.init();
   outparam->merge_keys.init();
+  outparam->intersect_keys.init();
   outparam->keys_in_use_for_query.init();
 
   /* Allocate handler */
@@ -2660,21 +2662,6 @@ enum open_frm_error open_table_from_share(THD *thd, TABLE_SHARE *share,
     else
       outparam->record[1]= outparam->record[0];   // Safety
   }
-
-#ifdef HAVE_valgrind
-  /*
-    We need this because when we read var-length rows, we are not updating
-    bytes after end of varchar
-  */
-  if (records > 1)
-  {
-    memcpy(outparam->record[0], share->default_values, share->rec_buff_length);
-    memcpy(outparam->record[1], share->default_values, share->null_bytes);
-    if (records > 2)
-      memcpy(outparam->record[1], share->default_values,
-             share->rec_buff_length);
-  }
-#endif
 
   if (!(field_ptr = (Field **) alloc_root(&outparam->mem_root,
                                           (uint) ((share->fields+1)*
@@ -2884,20 +2871,42 @@ partititon_err:
   /* Allocate bitmaps */
 
   bitmap_size= share->column_bitmap_size;
-  if (!(bitmaps= (uchar*) alloc_root(&outparam->mem_root, bitmap_size*6)))
+  bitmap_count= 6;
+  if (share->vfields)
+  {
+    if (!(outparam->def_vcol_set= (MY_BITMAP*)
+          alloc_root(&outparam->mem_root, sizeof(*outparam->def_vcol_set))))
+      goto err;
+    bitmap_count++;
+  }
+  if (!(bitmaps= (uchar*) alloc_root(&outparam->mem_root,
+                                     bitmap_size * bitmap_count)))
     goto err;
+
   my_bitmap_init(&outparam->def_read_set,
-              (my_bitmap_map*) bitmaps, share->fields, FALSE);
+                 (my_bitmap_map*) bitmaps, share->fields, FALSE);
+  bitmaps+= bitmap_size;
   my_bitmap_init(&outparam->def_write_set,
-              (my_bitmap_map*) (bitmaps+bitmap_size), share->fields, FALSE);
-  my_bitmap_init(&outparam->def_vcol_set,
-              (my_bitmap_map*) (bitmaps+bitmap_size*2), share->fields, FALSE);
+                 (my_bitmap_map*) bitmaps, share->fields, FALSE);
+  bitmaps+= bitmap_size;
+  if (share->vfields)
+  {
+    /* Don't allocate vcol_bitmap if we don't need it */
+    my_bitmap_init(outparam->def_vcol_set,
+                   (my_bitmap_map*) bitmaps, share->fields, FALSE);
+    bitmaps+= bitmap_size;
+  }
   my_bitmap_init(&outparam->tmp_set,
-              (my_bitmap_map*) (bitmaps+bitmap_size*3), share->fields, FALSE);
+                 (my_bitmap_map*) bitmaps, share->fields, FALSE);
+  bitmaps+= bitmap_size;
   my_bitmap_init(&outparam->eq_join_set,
-              (my_bitmap_map*) (bitmaps+bitmap_size*4), share->fields, FALSE);
+                 (my_bitmap_map*) bitmaps, share->fields, FALSE);
+  bitmaps+= bitmap_size;
   my_bitmap_init(&outparam->cond_set,
-              (my_bitmap_map*) (bitmaps+bitmap_size*5), share->fields, FALSE);
+                 (my_bitmap_map*) bitmaps, share->fields, FALSE);
+  bitmaps+= bitmap_size;
+  my_bitmap_init(&outparam->def_rpl_write_set,
+                 (my_bitmap_map*) bitmaps, share->fields, FALSE);
   outparam->default_column_bitmaps();
 
   outparam->cond_selectivity= 1.0;
@@ -2945,10 +2954,6 @@ partititon_err:
       goto err;
     }
   }
-
-#if defined(HAVE_valgrind) && !defined(DBUG_OFF)
-  bzero((char*) bitmaps, bitmap_size*3);
-#endif
 
   if (share->table_category == TABLE_CATEGORY_LOG)
   {
@@ -3439,18 +3444,23 @@ bool get_field(MEM_ROOT *mem, Field *field, String *res)
 {
   char buff[MAX_FIELD_WIDTH], *to;
   String str(buff,sizeof(buff),&my_charset_bin);
-  uint length;
+  bool rc;
+  THD *thd= field->get_thd();
+  ulonglong sql_mode_backup= thd->variables.sql_mode;
+  thd->variables.sql_mode&= ~MODE_PAD_CHAR_TO_FULL_LENGTH;
 
   field->val_str(&str);
-  if (!(length= str.length()))
+  if ((rc= !str.length() ||
+           !(to= strmake_root(mem, str.ptr(), str.length()))))
   {
     res->length(0);
-    return 1;
+    goto ex;
   }
-  if (!(to= strmake_root(mem, str.ptr(), length)))
-    length= 0;                                  // Safety fix
-  res->set(to, length, field->charset());
-  return 0;
+  res->set(to, str.length(), field->charset());
+
+ex:
+  thd->variables.sql_mode= sql_mode_backup;
+  return rc;
 }
 
 
@@ -3469,17 +3479,10 @@ bool get_field(MEM_ROOT *mem, Field *field, String *res)
 
 char *get_field(MEM_ROOT *mem, Field *field)
 {
-  char buff[MAX_FIELD_WIDTH], *to;
-  String str(buff,sizeof(buff),&my_charset_bin);
-  uint length;
-
-  field->val_str(&str);
-  length= str.length();
-  if (!length || !(to= (char*) alloc_root(mem,length+1)))
-    return NullS;
-  memcpy(to,str.ptr(),(uint) length);
-  to[length]=0;
-  return to;
+  String str;
+  bool rc= get_field(mem, field, &str);
+  DBUG_ASSERT(rc || str.ptr()[str.length()] == '\0');
+  return  rc ? NullS : (char *) str.ptr();
 }
 
 /*
@@ -4142,7 +4145,7 @@ bool TABLE::fill_item_list(List<Item> *item_list) const
   */
   for (Field **ptr= field; *ptr; ptr++)
   {
-    Item_field *item= new Item_field(*ptr);
+    Item_field *item= new (in_use->mem_root) Item_field(in_use, *ptr);
     if (!item || item_list->push_back(item))
       return TRUE;
   }
@@ -4390,7 +4393,7 @@ bool TABLE_LIST::prep_where(THD *thd, Item **conds,
             this expression will not be moved to WHERE condition (i.e. will
             be clean correctly for PS/SP)
           */
-          tbl->on_expr= and_conds(tbl->on_expr,
+          tbl->on_expr= and_conds(thd, tbl->on_expr,
                                   where->copy_andor_structure(thd));
           break;
         }
@@ -4400,7 +4403,7 @@ bool TABLE_LIST::prep_where(THD *thd, Item **conds,
         if (*conds && !(*conds)->fixed)
           res= (*conds)->fix_fields(thd, conds);
         if (!res)
-          *conds= and_conds(*conds, where->copy_andor_structure(thd));
+          *conds= and_conds(thd, *conds, where->copy_andor_structure(thd));
         if (*conds && !(*conds)->fixed && !res)
           res= (*conds)->fix_fields(thd, conds);
       }
@@ -4472,7 +4475,7 @@ merge_on_conds(THD *thd, TABLE_LIST *table, bool is_cascaded)
   {
     if (tbl->view && !is_cascaded)
       continue;
-    cond= and_conds(cond, merge_on_conds(thd, tbl, is_cascaded));
+    cond= and_conds(thd, cond, merge_on_conds(thd, tbl, is_cascaded));
   }
   DBUG_RETURN(cond);
 }
@@ -4532,10 +4535,10 @@ bool TABLE_LIST::prep_check_option(THD *thd, uint8 check_opt_type)
       for (TABLE_LIST *tbl= merge_underlying_list; tbl; tbl= tbl->next_local)
       {
         if (tbl->check_option)
-          check_option= and_conds(check_option, tbl->check_option);
+          check_option= and_conds(thd, check_option, tbl->check_option);
       }
     }
-    check_option= and_conds(check_option,
+    check_option= and_conds(thd, check_option,
                             merge_on_conds(thd, this, is_cascaded));
 
     if (arena)
@@ -5297,11 +5300,11 @@ Item *Field_iterator_table::create_item(THD *thd)
 {
   SELECT_LEX *select= thd->lex->current_select;
 
-  Item_field *item= new Item_field(thd, &select->context, *ptr);
+  Item_field *item= new (thd->mem_root) Item_field(thd, &select->context, *ptr);
   if (item && thd->variables.sql_mode & MODE_ONLY_FULL_GROUP_BY &&
       !thd->lex->in_sum_func && select->cur_pos_in_select_list != UNDEF_POS)
   {
-    select->non_agg_fields.push_back(item);
+    select->join->non_agg_fields.push_back(item);
     item->marker= select->cur_pos_in_select_list;
     select->set_non_agg_field_used(true);
   }
@@ -5354,9 +5357,10 @@ Item *create_view_field(THD *thd, TABLE_LIST *view, Item **field_ref,
   {
     DBUG_RETURN(field);
   }
-  Item *item= new Item_direct_view_ref(&view->view->select_lex.context,
-                                       field_ref, view->alias,
-                                       name, view);
+  Item *item= (new (thd->mem_root)
+               Item_direct_view_ref(thd, &view->view->select_lex.context,
+                                    field_ref, view->alias,
+                                    name, view));
   /*
     Force creation of nullable item for the result tmp table for outer joined
     views/derived tables.
@@ -5364,7 +5368,13 @@ Item *create_view_field(THD *thd, TABLE_LIST *view, Item **field_ref,
   if (view->table && view->table->maybe_null)
     item->maybe_null= TRUE;
   /* Save item in case we will need to fall back to materialization. */
-  view->used_items.push_front(item);
+  view->used_items.push_front(item, thd->mem_root);
+  /*
+    If we create this reference on persistent memory then it should be
+    present in persistent list
+  */
+  if (thd->mem_root == thd->stmt_arena->mem_root)
+    view->persistent_used_items.push_front(item, thd->mem_root);
   DBUG_RETURN(item);
 }
 
@@ -5559,7 +5569,7 @@ Field_iterator_table_ref::get_or_create_column_ref(THD *thd, TABLE_LIST *parent_
     /* The field belongs to a stored table. */
     Field *tmp_field= table_field_it.field();
     Item_field *tmp_item=
-      new Item_field(thd, &thd->lex->current_select->context, tmp_field);
+      new (thd->mem_root) Item_field(thd, &thd->lex->current_select->context, tmp_field);
     if (!tmp_item)
       return NULL;
     nj_col= new Natural_join_column(tmp_item, table_ref);
@@ -5667,10 +5677,14 @@ void TABLE::clear_column_bitmaps()
     Reset column read/write usage. It's identical to:
     bitmap_clear_all(&table->def_read_set);
     bitmap_clear_all(&table->def_write_set);
-    bitmap_clear_all(&table->def_vcol_set);
+    if (s->vfields) bitmap_clear_all(table->def_vcol_set);
+    The code assumes that the bitmaps are allocated after each other, as
+    guaranteed by open_table_from_share()
   */
-  bzero((char*) def_read_set.bitmap, s->column_bitmap_size*3);
-  column_bitmaps_set(&def_read_set, &def_write_set, &def_vcol_set);
+  bzero((char*) def_read_set.bitmap,
+        s->column_bitmap_size * (s->vfields ? 3 : 2));
+  column_bitmaps_set(&def_read_set, &def_write_set, def_vcol_set);
+  rpl_write_set= 0;                             // Safety
 }
 
 
@@ -5951,6 +5965,8 @@ void TABLE::mark_columns_needed_for_insert()
 /*
   Mark columns according the binlog row image option.
 
+  Columns to be written are stored in 'rpl_write_set'
+
   When logging in RBR, the user can select whether to
   log partial or full rows, depending on the table
   definition, and the value of binlog_row_image.
@@ -5962,16 +5978,16 @@ void TABLE::mark_columns_needed_for_insert()
   binlog_row_image= MINIMAL
     - This marks the PKE fields in the read_set
     - This marks all fields where a value was specified
-      in the write_set
+      in the rpl_write_set
 
   binlog_row_image= NOBLOB
     - This marks PKE + all non-blob fields in the read_set
     - This marks all fields where a value was specified
-      and all non-blob fields in the write_set
+      and all non-blob fields in the rpl_write_set
 
   binlog_row_image= FULL
     - all columns in the read_set
-    - all columns in the write_set
+    - all columns in the rpl_write_set
 
   This marking is done without resetting the original
   bitmaps. This means that we will strip extra fields in
@@ -5979,36 +5995,48 @@ void TABLE::mark_columns_needed_for_insert()
   we only want to log a PK and we needed other fields for
   execution).
 */
+
 void TABLE::mark_columns_per_binlog_row_image()
 {
+  THD *thd= in_use;
   DBUG_ENTER("mark_columns_per_binlog_row_image");
   DBUG_ASSERT(read_set->bitmap);
   DBUG_ASSERT(write_set->bitmap);
 
-  THD *thd= current_thd;
+  /* If not using row format */
+  rpl_write_set= write_set;
 
   /**
     If in RBR we may need to mark some extra columns,
     depending on the binlog-row-image command line argument.
    */
   if ((WSREP_EMULATE_BINLOG(thd) || mysql_bin_log.is_open()) &&
-      in_use &&
-      in_use->is_current_stmt_binlog_format_row() &&
+      thd->is_current_stmt_binlog_format_row() &&
       !ha_check_storage_engine_flag(s->db_type(), HTON_NO_BINLOG_ROW_OPT))
   {
     /* if there is no PK, then mark all columns for the BI. */
     if (s->primary_key >= MAX_KEY)
-      bitmap_set_all(read_set);
-
-    switch (thd->variables.binlog_row_image)
     {
+      bitmap_set_all(read_set);
+      rpl_write_set= read_set;
+    }
+    else
+    {
+      switch (thd->variables.binlog_row_image) {
       case BINLOG_ROW_IMAGE_FULL:
-        if (s->primary_key < MAX_KEY)
-          bitmap_set_all(read_set);
-        bitmap_set_all(write_set);
+        bitmap_set_all(read_set);
+        /* Set of columns that should be written (all) */
+        rpl_write_set= read_set;
         break;
       case BINLOG_ROW_IMAGE_NOBLOB:
-        /* for every field that is not set, mark it unless it is a blob */
+        /* Only write changed columns + not blobs */
+        rpl_write_set= &def_rpl_write_set;
+        bitmap_copy(rpl_write_set, write_set);
+
+        /*
+          for every field that is not set, mark it unless it is a blob or
+          part of a primary key
+        */
         for (Field **ptr=field ; *ptr ; ptr++)
         {
           Field *my_field= *ptr;
@@ -6019,24 +6047,30 @@ void TABLE::mark_columns_per_binlog_row_image()
 
             If set in the AI, then the blob is really needed, there is
             nothing we can do about it.
-           */
-          if ((s->primary_key < MAX_KEY) &&
-              ((my_field->flags & PRI_KEY_FLAG) ||
-              (my_field->type() != MYSQL_TYPE_BLOB)))
+          */
+          if ((my_field->flags & PRI_KEY_FLAG) ||
+              (my_field->type() != MYSQL_TYPE_BLOB))
+          {
             bitmap_set_bit(read_set, my_field->field_index);
-
-          if (my_field->type() != MYSQL_TYPE_BLOB)
-            bitmap_set_bit(write_set, my_field->field_index);
+            bitmap_set_bit(rpl_write_set, my_field->field_index);
+          }
         }
         break;
       case BINLOG_ROW_IMAGE_MINIMAL:
-        /* mark the primary key if available in the read_set */
-        if (s->primary_key < MAX_KEY)
-          mark_columns_used_by_index_no_reset(s->primary_key, read_set);
+        /*
+          mark the primary key in the read set so that we can find the row
+          that is updated / deleted.
+          We don't need to mark the primary key in the rpl_write_set as the
+          binary log will include all columns read anyway.
+        */
+        mark_columns_used_by_index_no_reset(s->primary_key, read_set);
+        /* Only write columns that have changed */
+        rpl_write_set= write_set;
         break;
 
       default:
         DBUG_ASSERT(FALSE);
+      }
     }
     file->column_bitmaps_signal();
   }
@@ -7085,6 +7119,7 @@ bool TABLE_LIST::handle_derived(LEX *lex, uint phases)
 {
   SELECT_LEX_UNIT *unit;
   DBUG_ENTER("handle_derived");
+  DBUG_PRINT("enter", ("phases: 0x%x", phases));
   if ((unit= get_unit()))
   {
     for (SELECT_LEX *sl= unit->first_select(); sl; sl= sl->next_select())
@@ -7328,7 +7363,7 @@ bool TABLE_LIST::change_refs_to_fields()
     DBUG_ASSERT(!field_it.end_of_fields());
     if (!materialized_items[idx])
     {
-      materialized_items[idx]= new Item_field(table->field[idx]);
+      materialized_items[idx]= new (thd->mem_root) Item_field(thd, table->field[idx]);
       if (!materialized_items[idx])
         return TRUE;
     }
@@ -7380,4 +7415,3 @@ double KEY::actual_rec_per_key(uint i)
   return (is_statistics_from_stat_tables ?
           read_stats->get_avg_frequency(i) : (double) rec_per_key[i]);
 }
-

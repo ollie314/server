@@ -40,6 +40,7 @@ buffer_pages_written	disabled
 buffer_index_pages_written	disabled
 buffer_non_index_pages_written	disabled
 buffer_pages_read	disabled
+buffer_pages0_read	disabled
 buffer_index_sec_rec_cluster_reads	disabled
 buffer_index_sec_rec_cluster_reads_avoided	disabled
 buffer_data_reads	disabled
@@ -215,6 +216,8 @@ innodb_log_flush_usec	disabled
 innodb_mem_validate_usec	disabled
 innodb_master_purge_usec	disabled
 innodb_dict_lru_usec	disabled
+innodb_dict_lru_count_active	disabled
+innodb_dict_lru_count_idle	disabled
 innodb_checkpoint_usec	disabled
 innodb_dblwr_writes	disabled
 innodb_dblwr_pages_written	disabled

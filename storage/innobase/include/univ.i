@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1994, 2013, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1994, 2016, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2008, Google Inc.
 Copyright (c) 2013, 2015, MariaDB Corporation.
 
@@ -45,7 +45,7 @@ Created 1/20/1994 Heikki Tuuri
 
 #define INNODB_VERSION_MAJOR	5
 #define INNODB_VERSION_MINOR	6
-#define INNODB_VERSION_BUGFIX	25
+#define INNODB_VERSION_BUGFIX	32
 
 /* The following is the InnoDB version as shown in
 SELECT plugin_version FROM information_schema.plugins;
@@ -249,8 +249,9 @@ operations (very slow); also UNIV_DEBUG must be defined */
 that are only referenced from within InnoDB, not from MySQL. We disable the
 GCC visibility directive on all Sun operating systems because there is no
 easy way to get it to work. See http://bugs.mysql.com/bug.php?id=52263. */
+#define MY_ATTRIBUTE __attribute__
 #if defined(__GNUC__) && (__GNUC__ >= 4) && !defined(sun) || defined(__INTEL_COMPILER)
-# define UNIV_INTERN __attribute__((visibility ("hidden")))
+# define UNIV_INTERN MY_ATTRIBUTE((visibility ("hidden")))
 #else
 # define UNIV_INTERN
 #endif
@@ -265,7 +266,7 @@ appears close together improving code locality of non-cold parts of
 program.  The paths leading to call of cold functions within code are
 marked as unlikely by the branch prediction mechanism.  optimize a
 rarely invoked function for size instead for speed. */
-# define UNIV_COLD __attribute__((cold))
+# define UNIV_COLD MY_ATTRIBUTE((cold))
 #else
 # define UNIV_COLD /* empty */
 #endif
@@ -372,10 +373,8 @@ Note: This must never change! */
 /** log2 of largest compressed page size (1<<14 == 16384 bytes).
 A compressed page directory entry reserves 14 bits for the start offset
 and 2 bits for flags. This limits the uncompressed page size to 16k.
-Even though a 16k uncompressed page can theoretically be compressed
-into a larger compressed page, it is not a useful feature so we will
-limit both with this same constant. */
-#define UNIV_ZIP_SIZE_SHIFT_MAX		15
+*/
+#define UNIV_ZIP_SIZE_SHIFT_MAX		14
 
 /* Define the Min, Max, Default page sizes. */
 /** Minimum Page Size Shift (power of 2) */
@@ -559,12 +558,12 @@ number indicate that a field contains a reference to an externally
 stored part of the field in the tablespace. The length field then
 contains the sum of the following flag and the locally stored len. */
 
-#define UNIV_EXTERN_STORAGE_FIELD (UNIV_SQL_NULL - UNIV_PAGE_SIZE_MAX)
+#define UNIV_EXTERN_STORAGE_FIELD (UNIV_SQL_NULL - UNIV_PAGE_SIZE_DEF)
 
 #if defined(__GNUC__) && (__GNUC__ > 2) && ! defined(__INTEL_COMPILER)
 #define HAVE_GCC_GT_2
 /* Tell the compiler that variable/function is unused. */
-# define UNIV_UNUSED    __attribute__ ((unused))
+# define UNIV_UNUSED    MY_ATTRIBUTE ((unused))
 #else
 # define UNIV_UNUSED
 #endif /* CHECK FOR GCC VER_GT_2 */

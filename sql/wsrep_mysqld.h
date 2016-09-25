@@ -50,6 +50,7 @@ struct wsrep_thd_shadow {
   ulong                tx_isolation;
   char                 *db;
   size_t               db_length;
+  my_hrtime_t          user_time;
 };
 
 // Global wsrep parameters
@@ -150,7 +151,6 @@ extern "C" query_id_t wsrep_thd_query_id(THD *thd);
 extern "C" query_id_t wsrep_thd_wsrep_last_query_id(THD *thd);
 extern "C" void wsrep_thd_set_wsrep_last_query_id(THD *thd, query_id_t id);
 
-
 extern void wsrep_close_client_connections(my_bool wait_to_end);
 extern int  wsrep_wait_committing_connections_close(int wait_time);
 extern void wsrep_close_applier(THD *thd);
@@ -161,16 +161,21 @@ extern void wsrep_kill_mysql(THD *thd);
 /* new defines */
 extern void wsrep_stop_replication(THD *thd);
 extern bool wsrep_start_replication();
+extern bool wsrep_must_sync_wait(THD* thd, uint mask = WSREP_SYNC_WAIT_BEFORE_READ);
 extern bool wsrep_sync_wait(THD* thd, uint mask = WSREP_SYNC_WAIT_BEFORE_READ);
 extern int  wsrep_check_opts();
 extern void wsrep_prepend_PATH (const char* path);
-/* some inline functions are defined in wsrep_mysqld_inl.h */
 
 /* Other global variables */
 extern wsrep_seqno_t wsrep_locked_seqno;
 
-#define WSREP_ON \
+#define WSREP_ON                         \
   (global_system_variables.wsrep_on)
+
+#define WSREP_ON_NEW                     \
+  ((global_system_variables.wsrep_on) && \
+   wsrep_provider                     && \
+   strcmp(wsrep_provider, WSREP_NONE))
 
 #define WSREP(thd) \
   (WSREP_ON && wsrep && (thd && thd->variables.wsrep_on))
@@ -281,14 +286,12 @@ void wsrep_to_isolation_end(THD *thd);
 void wsrep_cleanup_transaction(THD *thd);
 int wsrep_to_buf_helper(
   THD* thd, const char *query, uint query_len, uchar** buf, size_t* buf_len);
-int wsrep_create_sp(THD *thd, uchar** buf, size_t* buf_len);
-int wsrep_create_trigger_query(THD *thd, uchar** buf, size_t* buf_len);
 int wsrep_create_event_query(THD *thd, uchar** buf, size_t* buf_len);
-int wsrep_alter_event_query(THD *thd, uchar** buf, size_t* buf_len);
 
 extern bool
 wsrep_grant_mdl_exception(MDL_context *requestor_ctx,
-                           MDL_ticket *ticket);
+                          MDL_ticket *ticket,
+                          const MDL_key *key);
 IO_CACHE * get_trans_log(THD * thd);
 bool wsrep_trans_cache_is_empty(THD *thd);
 void thd_binlog_flush_pending_rows_event(THD *thd, bool stmt_end);
@@ -304,14 +307,14 @@ void wsrep_close_applier_threads(int count);
 void wsrep_wait_appliers_close(THD *thd);
 void wsrep_kill_mysql(THD *thd);
 void wsrep_close_threads(THD *thd);
-int wsrep_create_sp(THD *thd, uchar** buf, size_t* buf_len);
 void wsrep_copy_query(THD *thd);
 bool wsrep_is_show_query(enum enum_sql_command command);
 void wsrep_replay_transaction(THD *thd);
 bool wsrep_create_like_table(THD* thd, TABLE_LIST* table,
                              TABLE_LIST* src_table,
 	                     HA_CREATE_INFO *create_info);
-int wsrep_create_trigger_query(THD *thd, uchar** buf, size_t* buf_len);
+bool wsrep_node_is_donor();
+bool wsrep_node_is_synced();
 
 #else /* WITH_WSREP */
 
@@ -328,6 +331,7 @@ int wsrep_create_trigger_query(THD *thd, uchar** buf, size_t* buf_len);
 #define wsrep_prepend_PATH(X)
 #define wsrep_before_SE() (0)
 #define wsrep_init_startup(X)
+#define wsrep_must_sync_wait(...) (0)
 #define wsrep_sync_wait(...) (0)
 #define wsrep_to_isolation_begin(...) (0)
 #define wsrep_register_hton(...) do { } while(0)

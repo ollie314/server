@@ -1,11 +1,11 @@
 /************* RelDef CPP Program Source Code File (.CPP) **************/
 /* PROGRAM NAME: RELDEF                                                */
 /* -------------                                                       */
-/*  Version 1.4                                                        */
+/*  Version 1.5                                                        */
 /*                                                                     */
 /* COPYRIGHT:                                                          */
 /* ----------                                                          */
-/*  (C) Copyright to the author Olivier BERTRAND          2004-2015    */
+/*  (C) Copyright to the author Olivier BERTRAND          2004-2016    */
 /*                                                                     */
 /* WHAT THIS PROGRAM DOES:                                             */
 /* -----------------------                                             */
@@ -37,6 +37,7 @@
 #include "plgdbsem.h"
 #include "reldef.h"
 #include "colblk.h"
+#include "tabcol.h"
 #include "filamap.h"
 #include "filamfix.h"
 #include "filamvct.h"
@@ -57,6 +58,7 @@ extern handlerton *connect_hton;
 /*  External function.                                                 */
 /***********************************************************************/
 USETEMP UseTemp(void);
+char   *GetPluginDir(void);
 
 /* --------------------------- Class RELDEF -------------------------- */
 
@@ -216,11 +218,13 @@ TABDEF::TABDEF(void)
 /***********************************************************************/
 /*  Define: initialize the table definition block from XDB file.       */
 /***********************************************************************/
-bool TABDEF::Define(PGLOBAL g, PCATLG cat, LPCSTR name, LPCSTR am)
+bool TABDEF::Define(PGLOBAL g, PCATLG cat, 
+	                  LPCSTR name, LPCSTR schema, LPCSTR am)
   {
   int   poff = 0;
 
-  Name = (PSZ)PlugDup(g, name);
+  Name = (PSZ)name;
+	Schema = (PSZ)schema;
   Cat = cat;
   Hc = ((MYCAT*)cat)->GetHandler();
   Catfunc = GetFuncID(GetStringCatInfo(g, "Catfunc", NULL));
@@ -301,7 +305,7 @@ int TABDEF::GetColCatInfo(PGLOBAL g)
       case TAB_OEM:
         poff = 0;      // Offset represents an independant flag
         break;
-      default:         // VCT PLG ODBC MYSQL WMI...
+      default:         // VCT PLG ODBC JDBC MYSQL WMI...
         poff = 0;			 // NA
         break;
 			} // endswitch tc
@@ -510,10 +514,11 @@ PTABDEF OEMDEF::GetXdef(PGLOBAL g)
     } // endif getdef
 #else   // !__WIN__
   const char *error = NULL;
-  Dl_info dl_info;
     
 #if 0  // Don't know what all this stuff does
-  // The OEM lib must retrieve exported CONNECT variables
+	Dl_info dl_info;
+
+	// The OEM lib must retrieve exported CONNECT variables
   if (dladdr(&connect_hton, &dl_info)) {
     if (dlopen(dl_info.dli_fname, RTLD_NOLOAD | RTLD_NOW | RTLD_GLOBAL) == 0) {
       error = dlerror();
@@ -568,7 +573,7 @@ PTABDEF OEMDEF::GetXdef(PGLOBAL g)
     } // endif Cbuf
 
   // Here "OEM" should be replace by a more useful value
-  if (xdefp->Define(g, cat, Name, "OEM"))
+  if (xdefp->Define(g, cat, Name, Schema, "OEM"))
     return NULL;
 
   // Ok, return external block

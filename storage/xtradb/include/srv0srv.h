@@ -1,9 +1,9 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2013, Oracle and/or its affiliates.
+Copyright (c) 1995, 2016, Oracle and/or its affiliates. All rights reserved.
 Copyright (c) 2008, 2009, Google Inc.
 Copyright (c) 2009, Percona Inc.
-Copyright (c) 2013, 2015, MariaDB Corporation.
+Copyright (c) 2013, 2016, MariaDB Corporation
 
 Portions of this file contain modifications contributed and copyrighted by
 Google, Inc. Those modifications are gratefully acknowledged and are described
@@ -186,6 +186,9 @@ struct srv_stats_t {
 	/** Number of lock waits that have been up to max time (i.e.) lock
 	wait timeout */
 	ulint_ctr_1_t		n_lock_max_wait_time;
+
+	/** Number of times page 0 is read from tablespace */
+	ulint_ctr_64_t		page0_read;
 };
 
 extern const char*	srv_main_thread_op_info;
@@ -263,6 +266,9 @@ extern char*	srv_arch_dir;
 recovery and open all tables in RO mode instead of RW mode. We don't
 sync the max trx id to disk either. */
 extern my_bool	srv_read_only_mode;
+/** Set if InnoDB operates in read-only mode or innodb-force-recovery
+is greater than SRV_FORCE_NO_TRX_UNDO. */
+extern my_bool	high_level_read_only;
 /** store to its own file each table created by an user; data
 dictionary tables are in the system tablespace 0 */
 extern my_bool	srv_file_per_table;
@@ -293,6 +299,7 @@ OS (provided we compiled Innobase with it in), otherwise we will
 use simulated aio we build below with threads.
 Currently we support native aio on windows and linux */
 extern my_bool	srv_use_native_aio;
+extern my_bool	srv_numa_interleave;
 #ifdef __WIN__
 extern ibool	srv_use_native_conditions;
 #endif /* __WIN__ */
@@ -386,7 +393,6 @@ extern my_bool	srv_use_sys_malloc;
 extern ibool	srv_use_sys_malloc;
 #endif /* UNIV_HOTBACKUP */
 extern ulint	srv_buf_pool_size;	/*!< requested size in bytes */
-extern my_bool	srv_buf_pool_populate;	/*!< virtual page preallocation */
 extern ulint    srv_buf_pool_instances; /*!< requested number of buffer pool instances */
 extern ulong	srv_n_page_hash_locks;	/*!< number of locks to
 					protect buf_pool->page_hash */
@@ -396,6 +402,8 @@ extern ulong	srv_flush_neighbors;	/*!< whether or not to flush
 					neighbors of a block */
 extern ulint	srv_buf_pool_old_size;	/*!< previously requested size */
 extern ulint	srv_buf_pool_curr_size;	/*!< current size in bytes */
+extern ulong	srv_buf_pool_dump_pct;	/*!< dump that may % of each buffer
+					pool during BP dump */
 extern ulint	srv_mem_pool_size;
 extern ulint	srv_lock_table_size;
 
@@ -475,8 +483,6 @@ extern ulong	srv_innodb_stats_method;
 
 #ifdef UNIV_LOG_ARCHIVE
 extern ibool		srv_log_archive_on;
-extern ibool		srv_archive_recovery;
-extern ib_uint64_t	srv_archive_recovery_limit_lsn;
 #endif /* UNIV_LOG_ARCHIVE */
 
 extern char*	srv_file_flush_method_str;
@@ -514,7 +520,6 @@ extern my_bool			srv_stats_sample_traditional;
 
 extern ibool	srv_use_doublewrite_buf;
 extern ulong	srv_doublewrite_batch_size;
-extern ulong	srv_checksum_algorithm;
 
 extern ulong	srv_log_arch_expire_sec;
 
@@ -950,19 +955,29 @@ ulint
 srv_get_activity_count(void);
 /*========================*/
 /*******************************************************************//**
-Check if there has been any activity.
+Check if there has been any activity. Considers background change buffer
+merge as regular server activity unless a non-default
+old_ibuf_merge_activity_count value is passed, in which case the merge will be
+treated as keeping server idle.
 @return FALSE if no change in activity counter. */
 UNIV_INTERN
 ibool
 srv_check_activity(
 /*===============*/
-	ulint		old_activity_count);	/*!< old activity count */
+	ulint		old_activity_count,	/*!< old activity count */
+						/*!< old change buffer merge
+						activity count, or
+						ULINT_UNDEFINED */
+	ulint		old_ibuf_merge_activity_count = ULINT_UNDEFINED);
 /******************************************************************//**
 Increment the server activity counter. */
 UNIV_INTERN
 void
-srv_inc_activity_count(void);
-/*=========================*/
+srv_inc_activity_count(
+/*===================*/
+	bool ibuf_merge_activity = false);	/*!< whether this activity bump
+						is caused by the background
+						change buffer merge */
 
 /**********************************************************************//**
 Enqueues a task to server task queue and releases a worker thread, if there
@@ -1023,7 +1038,7 @@ UNIV_INTERN
 os_thread_ret_t
 DECLARE_THREAD(srv_purge_coordinator_thread)(
 /*=========================================*/
-	void*	arg __attribute__((unused)));	/*!< in: a dummy parameter
+	void*	arg MY_ATTRIBUTE((unused)));	/*!< in: a dummy parameter
 						required by os_thread_create */
 
 /*********************************************************************//**
@@ -1033,7 +1048,7 @@ UNIV_INTERN
 os_thread_ret_t
 DECLARE_THREAD(srv_worker_thread)(
 /*==============================*/
-	void*	arg __attribute__((unused)));	/*!< in: a dummy parameter
+	void*	arg MY_ATTRIBUTE((unused)));	/*!< in: a dummy parameter
 						required by os_thread_create */
 } /* extern "C" */
 
@@ -1149,7 +1164,8 @@ struct export_var_t{
 	ulint innodb_os_log_pending_fsyncs;	/*!< fil_n_pending_log_flushes */
 	ulint innodb_page_size;			/*!< UNIV_PAGE_SIZE */
 	ulint innodb_pages_created;		/*!< buf_pool->stat.n_pages_created */
-	ulint innodb_pages_read;		/*!< buf_pool->stat.n_pages_read */
+	ulint innodb_pages_read;		/*!< buf_pool->stat.n_pages_read*/
+	ulint innodb_page0_read;		/*!< srv_stats.page0_read */
 	ulint innodb_pages_written;		/*!< buf_pool->stat.n_pages_written */
 	ib_int64_t innodb_purge_trx_id;
 	ib_int64_t innodb_purge_undo_no;
@@ -1203,7 +1219,6 @@ struct export_var_t{
 	ulint innodb_purge_view_trx_id_age;	/*!< rw_max_trx_id
 						- purged view's min trx_id */
 #endif /* UNIV_DEBUG */
-
 
 	ib_int64_t innodb_page_compression_saved;/*!< Number of bytes saved
 						by page compression */
@@ -1286,6 +1301,7 @@ struct srv_slot_t{
 #else /* !UNIV_HOTBACKUP */
 # define srv_use_adaptive_hash_indexes		FALSE
 # define srv_use_native_aio			FALSE
+# define srv_numa_interleave			FALSE
 # define srv_force_recovery			0UL
 # define srv_set_io_thread_op_info(t,info)	((void) 0)
 # define srv_reset_io_thread_op_info()		((void) 0)

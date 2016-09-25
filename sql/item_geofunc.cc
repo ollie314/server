@@ -1,6 +1,5 @@
-/*
-   Copyright (c) 2003-2007 MySQL AB, 2009, 2010 Sun Microsystems, Inc.
-   Use is subject to license terms.
+/* Copyright (c) 2003, 2016, Oracle and/or its affiliates.
+   Copyright (c) 2011, 2016, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -38,9 +37,10 @@
 #include "set_var.h"
 #ifdef HAVE_SPATIAL
 #include <m_ctype.h>
+#include "opt_range.h"
 
 
-Field *Item_geometry_func::tmp_table_field(TABLE *t_arg)
+Field *Item_geometry_func::create_field_for_create_select(TABLE *t_arg)
 {
   Field *result;
   if ((result= new Field_geom(max_length, maybe_null, name, t_arg->s,
@@ -435,7 +435,7 @@ String *Item_func_convexhull::val_str(String *str_value)
   if (!cur_pi->get_next())
   {
     /* Single point. */
-    if (res_receiver.single_point(cur_pi->x, cur_pi->y))
+    if (res_receiver.single_point(cur_pi->node.shape.x, cur_pi->node.shape.y))
       goto mem_error;
     goto build_result;
   }
@@ -460,8 +460,8 @@ String *Item_func_convexhull::val_str(String *str_value)
   {
     /* We only have 2 nodes in the result, so we create a polyline. */
     if (res_receiver.start_shape(Gcalc_function::shape_line) ||
-        res_receiver.add_point(left_first->pi->x, left_first->pi->y) ||
-        res_receiver.add_point(left_cur->pi->x, left_cur->pi->y) ||
+        res_receiver.add_point(left_first->pi->node.shape.x, left_first->pi->node.shape.y) ||
+        res_receiver.add_point(left_cur->pi->node.shape.x, left_cur->pi->node.shape.y) ||
         res_receiver.complete_shape())
 
       goto mem_error;
@@ -474,7 +474,7 @@ String *Item_func_convexhull::val_str(String *str_value)
 
   while (left_first)
   {
-    if (res_receiver.add_point(left_first->pi->x, left_first->pi->y))
+    if (res_receiver.add_point(left_first->pi->node.shape.x, left_first->pi->node.shape.y))
       goto mem_error;
     left_first= left_first->get_next();
   }
@@ -484,7 +484,7 @@ String *Item_func_convexhull::val_str(String *str_value)
   right_cur= right_cur->prev;
   while (right_cur->prev)
   {
-    if (res_receiver.add_point(right_cur->pi->x, right_cur->pi->y))
+    if (res_receiver.add_point(right_cur->pi->node.shape.x, right_cur->pi->node.shape.y))
       goto mem_error;
     right_cur= right_cur->prev;
   }
@@ -929,6 +929,78 @@ err:
   Functions for spatial relations
 */
 
+static SEL_ARG sel_arg_impossible(SEL_ARG::IMPOSSIBLE);
+
+SEL_ARG *
+Item_func_spatial_rel::get_mm_leaf(RANGE_OPT_PARAM *param,
+                                   Field *field, KEY_PART *key_part,
+                                   Item_func::Functype type, Item *value)
+{
+  DBUG_ENTER("Item_func_spatial_rel::get_mm_leaf");
+  if (key_part->image_type != Field::itMBR)
+    DBUG_RETURN(0);
+  if (value->cmp_type() != STRING_RESULT)
+    DBUG_RETURN(&sel_arg_impossible);
+
+  if (param->using_real_indexes &&
+      !field->optimize_range(param->real_keynr[key_part->key],
+                             key_part->part))
+   DBUG_RETURN(0);
+
+  if (value->save_in_field_no_warnings(field, 1))
+    DBUG_RETURN(&sel_arg_impossible);            // Bad GEOMETRY value
+
+  DBUG_ASSERT(!field->real_maybe_null()); // SPATIAL keys do not support NULL
+
+  uchar *str= (uchar*) alloc_root(param->mem_root, key_part->store_length + 1);
+  if (!str)
+    DBUG_RETURN(0);                              // out of memory
+  field->get_key_image(str, key_part->length, key_part->image_type);
+  SEL_ARG *tree;
+  if (!(tree= new (param->mem_root) SEL_ARG(field, str, str)))
+    DBUG_RETURN(0);                              // out of memory
+
+  switch (type) {
+  case SP_EQUALS_FUNC:
+    tree->min_flag= GEOM_FLAG | HA_READ_MBR_EQUAL;// NEAR_MIN;//512;
+    tree->max_flag= NO_MAX_RANGE;
+    break;
+  case SP_DISJOINT_FUNC:
+    tree->min_flag= GEOM_FLAG | HA_READ_MBR_DISJOINT;// NEAR_MIN;//512;
+    tree->max_flag= NO_MAX_RANGE;
+    break;
+  case SP_INTERSECTS_FUNC:
+    tree->min_flag= GEOM_FLAG | HA_READ_MBR_INTERSECT;// NEAR_MIN;//512;
+    tree->max_flag= NO_MAX_RANGE;
+    break;
+  case SP_TOUCHES_FUNC:
+    tree->min_flag= GEOM_FLAG | HA_READ_MBR_INTERSECT;// NEAR_MIN;//512;
+    tree->max_flag= NO_MAX_RANGE;
+    break;
+  case SP_CROSSES_FUNC:
+    tree->min_flag= GEOM_FLAG | HA_READ_MBR_INTERSECT;// NEAR_MIN;//512;
+    tree->max_flag= NO_MAX_RANGE;
+    break;
+  case SP_WITHIN_FUNC:
+    tree->min_flag= GEOM_FLAG | HA_READ_MBR_WITHIN;// NEAR_MIN;//512;
+    tree->max_flag= NO_MAX_RANGE;
+    break;
+  case SP_CONTAINS_FUNC:
+    tree->min_flag= GEOM_FLAG | HA_READ_MBR_CONTAIN;// NEAR_MIN;//512;
+    tree->max_flag= NO_MAX_RANGE;
+    break;
+  case SP_OVERLAPS_FUNC:
+    tree->min_flag= GEOM_FLAG | HA_READ_MBR_INTERSECT;// NEAR_MIN;//512;
+    tree->max_flag= NO_MAX_RANGE;
+    break;
+  default:
+    DBUG_ASSERT(0);
+    break;
+  }
+  DBUG_RETURN(tree);
+}
+
+
 const char *Item_func_spatial_mbr_rel::func_name() const 
 { 
   switch (spatial_rel) {
@@ -1032,10 +1104,10 @@ static double count_edge_t(const Gcalc_heap::Info *ea,
                            double &ex, double &ey, double &vx, double &vy,
                            double &e_sqrlen)
 {
-  ex= eb->x - ea->x;
-  ey= eb->y - ea->y;
-  vx= v->x - ea->x;
-  vy= v->y - ea->y;
+  ex= eb->node.shape.x - ea->node.shape.x;
+  ey= eb->node.shape.y - ea->node.shape.y;
+  vx= v->node.shape.x - ea->node.shape.x;
+  vy= v->node.shape.y - ea->node.shape.y;
   e_sqrlen= ex * ex + ey * ey;
   return (ex * vx + ey * vy) / e_sqrlen;
 }
@@ -1051,8 +1123,8 @@ static double distance_to_line(double ex, double ey, double vx, double vy,
 static double distance_points(const Gcalc_heap::Info *a,
                               const Gcalc_heap::Info *b)
 {
-  double x= a->x - b->x;
-  double y= a->y - b->y;
+  double x= a->node.shape.x - b->node.shape.x;
+  double y= a->node.shape.y - b->node.shape.y;
   return sqrt(x * x + y * y);
 }
 
@@ -1079,7 +1151,7 @@ static int setup_relate_func(Geometry *g1, Geometry *g2,
     const char *mask)
 {
   int do_store_shapes=1;
-  uint shape_a, shape_b;
+  uint UNINIT_VAR(shape_a), UNINIT_VAR(shape_b);
   uint n_operands= 0;
   int last_shape_pos;
 
@@ -2260,7 +2332,7 @@ double Item_func_distance::val_real()
       continue;
 
 count_distance:
-    if (cur_point->shape >= obj2_si)
+    if (cur_point->node.shape.shape >= obj2_si)
       continue;
     cur_point_edge= !cur_point->is_bottom();
 
@@ -2268,13 +2340,13 @@ count_distance:
     {
       /* We only check vertices of object 2 */
       if (dist_point->type != Gcalc_heap::nt_shape_node ||
-          dist_point->shape < obj2_si)
+          dist_point->node.shape.shape < obj2_si)
         continue;
 
       /* if we have an edge to check */
-      if (dist_point->left)
+      if (dist_point->node.shape.left)
       {
-        t= count_edge_t(dist_point, dist_point->left, cur_point,
+        t= count_edge_t(dist_point, dist_point->node.shape.left, cur_point,
                         ex, ey, vx, vy, e_sqrlen);
         if ((t>0.0) && (t<1.0))
         {
@@ -2285,7 +2357,7 @@ count_distance:
       }
       if (cur_point_edge)
       {
-        t= count_edge_t(cur_point, cur_point->left, dist_point,
+        t= count_edge_t(cur_point, cur_point->node.shape.left, dist_point,
                         ex, ey, vx, vy, e_sqrlen);
         if ((t>0.0) && (t<1.0))
         {
@@ -2321,11 +2393,10 @@ String *Item_func_pointonsurface::val_str(String *str)
   Geometry *g;
   MBR mbr;
   const char *c_end;
-  double px, py, x0, y0;
+  double UNINIT_VAR(px), UNINIT_VAR(py), x0, y0;
   String *result= 0;
   const Gcalc_scan_iterator::point *pprev= NULL;
   uint32 srid;
-
 
   null_value= 1;
   if ((args[0]->null_value ||

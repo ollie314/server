@@ -1,6 +1,6 @@
 /*
-   Copyright (c) 2000, 2015, Oracle and/or its affiliates.
-   Copyright (c) 2009, 2015, MariaDB
+   Copyright (c) 2000, 2016, Oracle and/or its affiliates.
+   Copyright (c) 2009, 2016, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -20,16 +20,14 @@
 
 /* Classes in mysql */
 
-#include "my_global.h"      /* NO_EMBEDDED_ACCESS_CHECKS */
-#ifdef MYSQL_SERVER
-#include "unireg.h"                    // REQUIRED: for other includes
-#endif
+#include "my_global.h"                          /* NO_EMBEDDED_ACCESS_CHECKS */
 #include <waiting_threads.h>
 #include "sql_const.h"
 #include <mysql/plugin_audit.h>
 #include "log.h"
 #include "rpl_tblmap.h"
 #include "mdl.h"
+#include "field.h"                              // Create_field
 #include "probes_mysql.h"
 #include "sql_locale.h"     /* my_locale_st */
 #include "sql_profile.h"    /* PROFILING */
@@ -66,10 +64,8 @@ class Reprepare_observer;
 class Relay_log_info;
 struct rpl_group_info;
 class Rpl_filter;
-
 class Query_log_event;
 class Load_log_event;
-class Slave_log_event;
 class sp_rcontext;
 class sp_cache;
 class Lex_input_stream;
@@ -77,6 +73,7 @@ class Parser_state;
 class Rows_log_event;
 class Sroutine_hash_entry;
 class user_var_entry;
+struct Trans_binlog_info;
 class rpl_io_thread_info;
 class rpl_sql_thread_info;
 
@@ -633,6 +630,11 @@ typedef struct system_variables
   my_bool query_cache_strip_comments;
   my_bool sql_log_slow;
   my_bool sql_log_bin;
+  /*
+    A flag to help detect whether binary logging was temporarily disabled
+    (see tmp_disable_binlog(A) macro).
+  */
+  my_bool sql_log_bin_off;
   my_bool binlog_annotate_row_events;
   my_bool binlog_direct_non_trans_update;
 
@@ -701,6 +703,7 @@ typedef struct system_status_var
   ulong com_stmt_reset;
   ulong com_stmt_close;
 
+  ulong com_register_slave;
   ulong created_tmp_disk_tables_;
   ulong created_tmp_tables_;
   ulong ha_commit_count;
@@ -710,9 +713,11 @@ typedef struct system_status_var
   ulong ha_read_key_count;
   ulong ha_read_next_count;
   ulong ha_read_prev_count;
+  ulong ha_read_retry_count;
   ulong ha_read_rnd_count;
   ulong ha_read_rnd_next_count;
   ulong ha_read_rnd_deleted_count;
+
   /*
     This number doesn't include calls to the default implementation and
     calls made by range access. The intent is to count only calls made by
@@ -746,6 +751,8 @@ typedef struct system_status_var
   ulong select_range_count_;
   ulong select_range_check_count_;
   ulong select_scan_count_;
+  ulong update_scan_count;
+  ulong delete_scan_count;
   ulong executed_triggers;
   ulong long_query_count;
   ulong filesort_merge_passes_;
@@ -818,6 +825,20 @@ void add_to_status(STATUS_VAR *to_var, STATUS_VAR *from_var);
 
 void add_diff_to_status(STATUS_VAR *to_var, STATUS_VAR *from_var,
                         STATUS_VAR *dec_var);
+
+/*
+  Update global_memory_used. We have to do this with atomic_add as the
+  global value can change outside of LOCK_status.
+*/
+inline void update_global_memory_status(int64 size)
+{
+  DBUG_PRINT("info", ("global memory_used: %lld  size: %lld",
+                      (longlong) global_status_var.global_memory_used,
+                      size));
+  // workaround for gcc 4.2.4-1ubuntu4 -fPIE (from DEB_BUILD_HARDENING=1)
+  int64 volatile * volatile ptr= &global_status_var.global_memory_used;
+  my_atomic_add64_explicit(ptr, size, MY_MEMORY_ORDER_RELAXED);
+}
 
 /**
   Get collation by name, send error to client on failure.
@@ -1428,7 +1449,8 @@ enum enum_thread_type
   SYSTEM_THREAD_EVENT_SCHEDULER= 8,
   SYSTEM_THREAD_EVENT_WORKER= 16,
   SYSTEM_THREAD_BINLOG_BACKGROUND= 32,
-  SYSTEM_THREAD_SLAVE_INIT= 64
+  SYSTEM_THREAD_SLAVE_INIT= 64,
+  SYSTEM_THREAD_SLAVE_BACKGROUND= 128
 };
 
 inline char const *
@@ -2038,6 +2060,9 @@ public:
   */
   const char *where;
 
+  /* Needed by MariaDB semi sync replication */
+  Trans_binlog_info *semisync_info;
+
   ulong client_capabilities;		/* What the client supports */
   ulong max_client_packet_length;
 
@@ -2106,10 +2131,10 @@ public:
   /* Do not set socket timeouts for wait_timeout (used with threadpool) */
   bool skip_wait_timeout;
 
-  /* container for handler's private per-connection data */
-  Ha_data ha_data[MAX_HA];
-
   bool prepare_derived_at_open;
+
+  /* Set to 1 if status of this THD is already in global status */
+  bool status_in_global;
 
   /* 
     To signal that the tmp table to be created is created for materialized
@@ -2118,6 +2143,9 @@ public:
   bool create_tmp_table_for_derived;
 
   bool save_prep_leaf_list;
+
+  /* container for handler's private per-connection data */
+  Ha_data ha_data[MAX_HA];
 
 #ifndef MYSQL_CLIENT
   binlog_cache_mngr *  binlog_setup_trx_data();
@@ -2168,7 +2196,19 @@ public:
   int is_current_stmt_binlog_format_row() const {
     DBUG_ASSERT(current_stmt_binlog_format == BINLOG_FORMAT_STMT ||
                 current_stmt_binlog_format == BINLOG_FORMAT_ROW);
-    return WSREP_FORMAT(current_stmt_binlog_format) == BINLOG_FORMAT_ROW;
+    return current_stmt_binlog_format == BINLOG_FORMAT_ROW;
+  }
+  /**
+    Determine if binlogging is disabled for this session
+    @retval 0 if the current statement binlogging is disabled
+              (could be because of binlog closed/binlog option
+               is set to false).
+    @retval 1 if the current statement will be binlogged
+  */
+  inline bool is_current_stmt_binlog_disabled() const
+  {
+    return (!(variables.option_bits & OPTION_BIN_LOG) ||
+            !mysql_bin_log.is_open());
   }
 
   enum binlog_filter_state
@@ -2620,6 +2660,7 @@ public:
   ulong      query_plan_fsort_passes; 
   pthread_t  real_id;                           /* For debugging */
   my_thread_id  thread_id;
+  uint32      os_thread_id;
   uint	     tmp_table, global_disable_checkpoint;
   uint	     server_status,open_options;
   enum enum_thread_type system_thread;
@@ -3046,12 +3087,12 @@ public:
     set_start_time();
     start_utime= utime_after_lock= microsecond_interval_timer();
   }
-  inline void	set_time(my_hrtime_t t)
+  inline void set_time(my_hrtime_t t)
   {
     user_time= t;
     set_time();
   }
-  inline void	set_time(my_time_t t, ulong sec_part)
+  inline void set_time(my_time_t t, ulong sec_part)
   {
     my_hrtime_t hrtime= { hrtime_from_time(t) + sec_part };
     set_time(hrtime);
@@ -3826,8 +3867,12 @@ public:
 
   void add_status_to_global()
   {
+    DBUG_ASSERT(status_in_global == 0);
     mysql_mutex_lock(&LOCK_status);
     add_to_status(&global_status_var, &status_var);
+    /* Mark that this THD status has already been added in global status */
+    status_var.global_memory_used= 0;
+    status_in_global= 1;
     mysql_mutex_unlock(&LOCK_status);
   }
 
@@ -3900,7 +3945,7 @@ private:
 
   /* Protect against add/delete of temporary tables in parallel replication */
   void rgi_lock_temporary_tables();
-  void rgi_unlock_temporary_tables();
+  void rgi_unlock_temporary_tables(bool clear);
   bool rgi_have_temporary_tables();
 public:
   /*
@@ -3924,15 +3969,15 @@ public:
     if (rgi_slave)
       rgi_lock_temporary_tables();
   }
-  inline void unlock_temporary_tables()
+  inline void unlock_temporary_tables(bool clear)
   {
     if (rgi_slave)
-      rgi_unlock_temporary_tables();
+      rgi_unlock_temporary_tables(clear);
   }    
   inline bool have_temporary_tables()
   {
     return (temporary_tables ||
-            (rgi_slave && rgi_have_temporary_tables()));
+            (rgi_slave && unlikely(rgi_have_temporary_tables())));
   }
 
   LF_PINS *tdc_hash_pins;
@@ -3978,6 +4023,14 @@ public:
 #endif /*  GTID_SUPPORT */
   void                      *wsrep_apply_format;
   char                      wsrep_info[128]; /* string for dynamic proc info */
+  /*
+    When enabled, do not replicate/binlog updates from the current table that's
+    being processed. At the moment, it is used to keep mysql.gtid_slave_pos
+    table updates from being replicated to other nodes via galera replication.
+  */
+  bool                      wsrep_ignore_table;
+  wsrep_gtid_t              wsrep_sync_wait_gtid;
+  ulong                     wsrep_affected_rows;
 #endif /* WITH_WSREP */
 
   /* Handling of timeouts for commands */
@@ -4036,11 +4089,14 @@ my_eof(THD *thd)
   thd->get_stmt_da()->set_eof_status(thd);
 }
 
-#define tmp_disable_binlog(A)       \
+#define tmp_disable_binlog(A)                                              \
   {ulonglong tmp_disable_binlog__save_options= (A)->variables.option_bits; \
-  (A)->variables.option_bits&= ~OPTION_BIN_LOG
+  (A)->variables.option_bits&= ~OPTION_BIN_LOG;                            \
+  (A)->variables.sql_log_bin_off= 1;
 
-#define reenable_binlog(A)   (A)->variables.option_bits= tmp_disable_binlog__save_options;}
+#define reenable_binlog(A)                                                  \
+  (A)->variables.option_bits= tmp_disable_binlog__save_options;             \
+  (A)->variables.sql_log_bin_off= 0;}
 
 
 inline sql_mode_t sql_mode_for_dates(THD *thd)
@@ -4080,6 +4136,8 @@ class JOIN;
 class select_result_sink: public Sql_alloc
 {
 public:
+  THD *thd;
+  select_result_sink(THD *thd_arg): thd(thd_arg) {}
   /*
     send_data returns 0 on ok, 1 on error and -1 if data was ignored, for
     example for a duplicate row entry written to a temp table.
@@ -4104,7 +4162,6 @@ public:
 class select_result :public select_result_sink 
 {
 protected:
-  THD *thd;
   /* 
     All descendant classes have their send_data() skip the first 
     unit->offset_limit_cnt rows sent.  Select_materialize
@@ -4113,7 +4170,7 @@ protected:
   SELECT_LEX_UNIT *unit;
   /* Something used only by the parser: */
 public:
-  select_result(THD *thd_arg): thd(thd_arg) {}
+  select_result(THD *thd_arg): select_result_sink(thd_arg) {}
   virtual ~select_result() {};
   /**
     Change wrapped select_result.
@@ -4200,9 +4257,8 @@ class select_result_explain_buffer : public select_result_sink
 {
 public:
   select_result_explain_buffer(THD *thd_arg, TABLE *table_arg) : 
-    thd(thd_arg), dst_table(table_arg) {};
+    select_result_sink(thd_arg), dst_table(table_arg) {};
 
-  THD *thd;
   TABLE *dst_table; /* table to write into */
 
   /* The following is called in the child thread: */
@@ -4219,7 +4275,7 @@ public:
 class select_result_text_buffer : public select_result_sink
 {
 public:
-  select_result_text_buffer(THD *thd_arg) : thd(thd_arg) {}
+  select_result_text_buffer(THD *thd_arg): select_result_sink(thd_arg) {}
   int send_data(List<Item> &items);
   bool send_result_set_metadata(List<Item> &fields, uint flag);
 
@@ -4227,7 +4283,6 @@ public:
 private:
   int append_row(List<Item> &items, bool send_names);
 
-  THD *thd;
   List<char*> rows;
   int n_columns;
 };
@@ -4445,10 +4500,14 @@ public:
 #define TMP_ENGINE_COLUMNDEF MARIA_COLUMNDEF
 #define TMP_ENGINE_HTON maria_hton
 #define TMP_ENGINE_NAME "Aria"
+inline uint tmp_table_max_key_length() { return maria_max_key_length(); }
+inline uint tmp_table_max_key_parts() { return maria_max_key_segments(); }
 #else
 #define TMP_ENGINE_COLUMNDEF MI_COLUMNDEF
 #define TMP_ENGINE_HTON myisam_hton
 #define TMP_ENGINE_NAME "MyISAM"
+inline uint tmp_table_max_key_length() { return MI_MAX_KEY_LENGTH; }
+inline uint tmp_table_max_key_parts() { return MI_MAX_KEY_SEG; }
 #endif
 
 /*
@@ -4504,8 +4563,6 @@ public:
   uint	group_parts,group_length,group_null_parts;
   uint	quick_group;
   bool  using_indirect_summary_function;
-  /* If >0 convert all blob fields to varchar(convert_blob_length) */
-  uint  convert_blob_length;
   CHARSET_INFO *table_charset;
   bool schema_table;
   /* TRUE if the temp table is created for subquery materialization. */
@@ -4534,7 +4591,7 @@ public:
 
   TMP_TABLE_PARAM()
     :copy_field(0), group_parts(0),
-     group_length(0), group_null_parts(0), convert_blob_length(0),
+     group_length(0), group_null_parts(0),
     schema_table(0), materialized_subquery(0), force_not_null_cols(0),
     precomputed_group_by(0),
     force_copy_fields(0), bit_fields_as_long(0), skip_create_table(0)
@@ -4934,6 +4991,7 @@ public:
 // this is needed for user_vars hash
 class user_var_entry
 {
+  CHARSET_INFO *m_charset;
  public:
   user_var_entry() {}                         /* Remove gcc warning */
   LEX_STRING name;
@@ -4947,7 +5005,8 @@ class user_var_entry
   longlong val_int(bool *null_value) const;
   String *val_str(bool *null_value, String *str, uint decimals);
   my_decimal *val_decimal(bool *null_value, my_decimal *result);
-  DTCollation collation;
+  CHARSET_INFO *charset() const { return m_charset; }
+  void set_charset(CHARSET_INFO *cs) { m_charset= cs; }
 };
 
 user_var_entry *get_variable(HASH *hash, LEX_STRING &name,
@@ -5309,7 +5368,7 @@ inline bool add_item_to_list(THD *thd, Item *item)
 
 inline bool add_value_to_list(THD *thd, Item *value)
 {
-  return thd->lex->value_list.push_back(value);
+  return thd->lex->value_list.push_back(value, thd->mem_root);
 }
 
 inline bool add_order_to_list(THD *thd, Item *item, bool asc)
@@ -5325,6 +5384,13 @@ inline bool add_gorder_to_list(THD *thd, Item *item, bool asc)
 inline bool add_group_to_list(THD *thd, Item *item, bool asc)
 {
   return thd->lex->current_select->add_group_to_list(thd, item, asc);
+}
+
+inline Item *and_conds(THD *thd, Item *a, Item *b)
+{
+  if (!b) return a;
+  if (!a) return b;
+  return new (thd->mem_root) Item_cond_and(thd, a, b);
 }
 
 /* inline handler methods that need to know TABLE and THD structures */

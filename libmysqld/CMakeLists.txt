@@ -75,6 +75,7 @@ SET(SQL_EMBEDDED_SOURCES emb_qcache.cc libmysqld.c lib_sql.cc
            ../sql/debug_sync.cc ../sql/opt_table_elimination.cc
            ../sql/sql_prepare.cc ../sql/sql_rename.cc ../sql/sql_repl.cc 
            ../sql/sql_select.cc ../sql/sql_servers.cc
+           ../sql/group_by_handler.cc
            ../sql/sql_show.cc ../sql/sql_state.c 
            ../sql/sql_statistics.cc ../sql/sql_string.cc
            ../sql/sql_tablespace.cc ../sql/sql_table.cc ../sql/sql_test.cc
@@ -104,6 +105,7 @@ SET(SQL_EMBEDDED_SOURCES emb_qcache.cc libmysqld.c lib_sql.cc
            ../sql/sql_explain.cc ../sql/sql_explain.h
            ../sql/sql_analyze_stmt.cc ../sql/sql_analyze_stmt.h
            ../sql/compat56.cc
+           ../sql/sql_type.cc ../sql/sql_type.h
            ../sql/table_cache.cc ../sql/mf_iocache_encr.cc
            ../sql/item_inetfunc.cc
            ../sql/wsrep_dummy.cc ../sql/encryption.cc
@@ -120,8 +122,12 @@ ADD_DEPENDENCIES(sql_embedded GenError GenServerSource)
 # On Unix, it is libmysqld.a
 IF(WIN32)
   SET(MYSQLSERVER_OUTPUT_NAME mysqlserver)
+  SET(COMPONENT_MYSQLSERVER "Embedded")
+  SET(COMPONENT_LIBMYSQLD "Embedded")
 ELSE()
   SET(MYSQLSERVER_OUTPUT_NAME mysqld)
+  SET(COMPONENT_MYSQLSERVER "Development")
+  SET(COMPONENT_LIBMYSQLD "Server")
 ENDIF()
 
 
@@ -146,9 +152,9 @@ FOREACH(LIB ${LIBS})
 ENDFOREACH()
 
 MERGE_LIBRARIES(mysqlserver STATIC ${EMBEDDED_LIBS} 
-  OUTPUT_NAME ${MYSQLSERVER_OUTPUT_NAME} COMPONENT Development)
+  OUTPUT_NAME ${MYSQLSERVER_OUTPUT_NAME} COMPONENT ${COMPONENT_MYSQLSERVER})
 
-INSTALL(FILES embedded_priv.h DESTINATION ${INSTALL_INCLUDEDIR}/private COMPONENT Development)
+INSTALL(FILES embedded_priv.h DESTINATION ${INSTALL_INCLUDEDIR}/private COMPONENT  ${COMPONENT_MYSQLSERVER})
 
 # Visual Studio users need debug  static library 
 IF(MSVC)
@@ -175,7 +181,7 @@ ENDFOREACH()
 
 IF(NOT DISABLE_SHARED)
   MERGE_LIBRARIES(libmysqld SHARED mysqlserver EXPORTS ${EMBEDDED_API}
-    COMPONENT Server) 
+    COMPONENT  ${COMPONENT_LIBMYSQLD})
   IF(UNIX)
     # Name the shared library, handle versioning (provides same api as client
     # library hence the same version)

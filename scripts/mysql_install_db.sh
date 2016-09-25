@@ -202,8 +202,10 @@ cannot_find_file()
   fi
 
   echo
-  echo "If you compiled from source, you need to run 'make install' to"
+  echo "If you compiled from source, you need to either run 'make install' to"
   echo "copy the software into the correct location ready for operation."
+  echo "If you don't want to do a full install, you can use the --srcddir"
+  echo "option to only install the mysql database and privilege tables"
   echo
   echo "If you are using a binary release, you must either be at the top"
   echo "level of the extracted archive, or pass the --basedir option"
@@ -214,7 +216,7 @@ cannot_find_file()
 # Ok, let's go.  We first need to parse arguments which are required by
 # my_print_defaults so that we can execute it first, then later re-parse
 # the command line to add any extra bits that we need.
-parse_arguments PICK-ARGS-FROM-ARGV "$@"
+parse_arguments "$@"
 
 #
 # We can now find my_print_defaults.  This script supports:
@@ -268,7 +270,8 @@ then
   extra_bindir="$basedir/extra"
   mysqld="$basedir/sql/mysqld"
   langdir="$basedir/sql/share/english"
-  pkgdatadir="$srcdir/scripts"
+  srcpkgdatadir="$srcdir/scripts"
+  buildpkgdatadir="$builddir/scripts"
   scriptdir="$srcdir/scripts"
 elif test -n "$basedir"
 then
@@ -286,7 +289,8 @@ then
     cannot_find_file errmsg.sys $basedir/share/english $basedir/share/mysql/english
     exit 1
   fi
-  pkgdatadir=`find_in_basedir --dir fill_help_tables.sql share share/mysql`
+  srcpkgdatadir=`find_in_basedir --dir fill_help_tables.sql share share/mysql`
+  buildpkgdatadir=$srcpkgdatadir
   if test -z "$pkgdatadir"
   then
     cannot_find_file fill_help_tables.sql $basedir/share $basedir/share/mysql
@@ -298,16 +302,17 @@ else
   bindir="@bindir@"
   extra_bindir="$bindir"
   mysqld="@libexecdir@/mysqld"
-  pkgdatadir="@pkgdatadir@"
+  srcpkgdatadir="@pkgdatadir@"
+  buildpkgdatadir="@pkgdatadir@"
   scriptdir="@scriptdir@"
 fi
 
 # Set up paths to SQL scripts required for bootstrap
-fill_help_tables="$pkgdatadir/fill_help_tables.sql"
-create_system_tables="$pkgdatadir/mysql_system_tables.sql"
-create_system_tables2="$pkgdatadir/mysql_performance_tables.sql"
-fill_system_tables="$pkgdatadir/mysql_system_tables_data.sql"
-maria_add_gis_sp="$pkgdatadir/maria_add_gis_sp_bootstrap.sql"
+fill_help_tables="$srcpkgdatadir/fill_help_tables.sql"
+create_system_tables="$srcpkgdatadir/mysql_system_tables.sql"
+create_system_tables2="$srcpkgdatadir/mysql_performance_tables.sql"
+fill_system_tables="$srcpkgdatadir/mysql_system_tables_data.sql"
+maria_add_gis_sp="$buildpkgdatadir/maria_add_gis_sp_bootstrap.sql"
 
 for f in "$fill_help_tables" "$create_system_tables" "$create_system_tables2" "$fill_system_tables" "$maria_add_gis_sp"
 do
@@ -417,7 +422,7 @@ mysqld_bootstrap="${MYSQLD_BOOTSTRAP-$mysqld}"
 mysqld_install_cmd_line()
 {
   "$mysqld_bootstrap" $defaults "$mysqld_opt" --bootstrap \
-  "--basedir=$basedir" "--datadir=$ldata" --log-warnings=0 \
+  "--basedir=$basedir" "--datadir=$ldata" --log-warnings=0 --enforce-storage-engine="" \
   $args --max_allowed_packet=8M \
   --net_buffer_length=16K
 }
@@ -471,7 +476,7 @@ else
 fi
 
 s_echo "Creating OpenGIS required SP-s..."
-if { echo "use test;"; cat "$maria_add_gis_sp"; } | mysqld_install_cmd_line > /dev/null
+if { echo "use mysql;"; cat "$maria_add_gis_sp"; } | mysqld_install_cmd_line > /dev/null
 then
   s_echo "OK"
 else

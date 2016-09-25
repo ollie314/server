@@ -1,7 +1,8 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2014, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2016, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2009, Google Inc.
+Copyright (C) 2014, 2016, MariaDB Corporation. All Rights Reserved.
 
 Portions of this file contain modifications contributed and copyrighted by
 Google, Inc. Those modifications are gratefully acknowledged and are described
@@ -33,9 +34,12 @@ Created 12/9/1995 Heikki Tuuri
 #include "config.h"
 #ifdef HAVE_ALLOCA_H
 #include "alloca.h"
-#elif defined(HAVE_MALLOC_H) 
+#elif defined(HAVE_MALLOC_H)
 #include "malloc.h"
 #endif
+
+/* Used for debugging */
+// #define DEBUG_CRYPT 1
 
 #include "log0log.h"
 
@@ -260,7 +264,7 @@ log_buffer_extend(
 {
 	ulint	move_start;
 	ulint	move_end;
-	byte*	tmp_buf = static_cast<byte *>(alloca(OS_FILE_LOG_BLOCK_SIZE));
+	byte*	tmp_buf = reinterpret_cast<byte *>(alloca(OS_FILE_LOG_BLOCK_SIZE));
 
 	mutex_enter(&(log_sys->mutex));
 
@@ -1082,8 +1086,7 @@ log_group_init(
 	ulint	space_id,		/*!< in: space id of the file space
 					which contains the log files of this
 					group */
-	ulint	archive_space_id __attribute__((unused)))
-					/*!< in: space id of the file space
+	ulint	archive_space_id)	/*!< in: space id of the file space
 					which contains some archived log
 					files for this group; currently, only
 					for the first log group this is
@@ -1394,7 +1397,6 @@ log_group_file_header_flush(
 Stores a 4-byte checksum to the trailer checksum field of a log block
 before writing it to a log file. This checksum is used in recovery to
 check the consistency of a log block. */
-static
 void
 log_block_store_checksum(
 /*=====================*/
@@ -1511,6 +1513,14 @@ loop:
 
 		log_encrypt_before_write(log_sys->next_checkpoint_no,
 					 buf, write_len);
+
+#ifdef DEBUG_CRYPT
+		fprintf(stderr, "WRITE: block: %lu checkpoint: %lu %.8lx %.8lx\n",
+			log_block_get_hdr_no(buf),
+			log_block_get_checkpoint_no(buf),
+			log_block_calc_checksum(buf),
+			log_block_get_checksum(buf));
+#endif
 
 		fil_io(OS_FILE_WRITE | OS_FILE_LOG, true, group->space_id, 0,
 		       (ulint) (next_offset / UNIV_PAGE_SIZE),
@@ -2320,7 +2330,10 @@ log_checkpoint(
 	* the checkpoint info has been written and THEN blocks will be encrypted
 	* with new key
 	*/
-	log_crypt_set_ver_and_key(log_sys->next_checkpoint_no + 1);
+	if (srv_encrypt_log) {
+		log_crypt_set_ver_and_key(log_sys->next_checkpoint_no + 1);
+	}
+
 	log_groups_write_checkpoint_info();
 
 	MONITOR_INC(MONITOR_NUM_CHECKPOINT);
@@ -2585,7 +2598,23 @@ loop:
 		mutex_enter(&log_sys->mutex);
 	}
 
+#ifdef DEBUG_CRYPT
+	fprintf(stderr, "BEFORE DECRYPT: block: %lu checkpoint: %lu %.8lx %.8lx offset %lu\n",
+		log_block_get_hdr_no(buf),
+			log_block_get_checkpoint_no(buf),
+			log_block_calc_checksum(buf),
+		log_block_get_checksum(buf), source_offset);
+#endif
+
 	log_decrypt_after_read(buf, len);
+
+#ifdef DEBUG_CRYPT
+	fprintf(stderr, "AFTER DECRYPT: block: %lu checkpoint: %lu %.8lx %.8lx\n",
+			log_block_get_hdr_no(buf),
+			log_block_get_checkpoint_no(buf),
+			log_block_calc_checksum(buf),
+			log_block_get_checksum(buf));
+#endif
 
 	if (release_mutex) {
 		mutex_exit(&log_sys->mutex);
@@ -2612,7 +2641,7 @@ log_archived_file_name_gen(
 /*=======================*/
 	char*	buf,	/*!< in: buffer where to write */
 	ulint	buf_len,/*!< in: buffer length */
-	ulint	id __attribute__((unused)),
+	ulint	id MY_ATTRIBUTE((unused)),
 			/*!< in: group id;
 			currently we only archive the first group */
 	lsn_t	file_no)/*!< in: file number */
@@ -3274,10 +3303,9 @@ log_archive_close_groups(
 Writes the log contents to the archive up to the lsn when this function was
 called, and stops the archiving. When archiving is started again, the archived
 log file numbers start from 2 higher, so that the archiving will not write
-again to the archived log files which exist when this function returns.
-@return	DB_SUCCESS or DB_ERROR */
-UNIV_INTERN
-ulint
+again to the archived log files which exist when this function returns. */
+static
+void
 log_archive_stop(void)
 /*==================*/
 {
@@ -3285,13 +3313,7 @@ log_archive_stop(void)
 
 	mutex_enter(&(log_sys->mutex));
 
-	if (log_sys->archiving_state != LOG_ARCH_ON) {
-
-		mutex_exit(&(log_sys->mutex));
-
-		return(DB_ERROR);
-	}
-
+	ut_ad(log_sys->archiving_state == LOG_ARCH_ON);
 	log_sys->archiving_state = LOG_ARCH_STOPPING;
 
 	mutex_exit(&(log_sys->mutex));
@@ -3333,8 +3355,6 @@ log_archive_stop(void)
 	log_sys->archiving_state = LOG_ARCH_STOPPED;
 
 	mutex_exit(&(log_sys->mutex));
-
-	return(DB_SUCCESS);
 }
 
 /****************************************************************//**
@@ -3371,6 +3391,7 @@ ulint
 log_archive_noarchivelog(void)
 /*==========================*/
 {
+	ut_ad(!srv_read_only_mode);
 loop:
 	mutex_enter(&(log_sys->mutex));
 
@@ -3403,6 +3424,8 @@ ulint
 log_archive_archivelog(void)
 /*========================*/
 {
+	ut_ad(!srv_read_only_mode);
+
 	mutex_enter(&(log_sys->mutex));
 
 	if (log_sys->archiving_state == LOG_ARCH_OFF) {
@@ -3753,12 +3776,7 @@ loop:
 
 	lsn = log_sys->lsn;
 
-	ut_ad(srv_force_recovery != SRV_FORCE_NO_LOG_REDO
-	      || lsn == log_sys->last_checkpoint_lsn + LOG_BLOCK_HDR_SIZE);
-
-
-	if ((srv_force_recovery != SRV_FORCE_NO_LOG_REDO
-	     && lsn != log_sys->last_checkpoint_lsn)
+	if (lsn != log_sys->last_checkpoint_lsn
 	    || (srv_track_changed_pages
 		&& (tracked_lsn != log_sys->last_checkpoint_lsn))
 #ifdef UNIV_LOG_ARCHIVE
@@ -3985,7 +4003,7 @@ log_print(
 			"Log tracking enabled\n"
 			"Log tracked up to   " LSN_PF "\n"
 			"Max tracked LSN age " LSN_PF "\n",
-			log_get_tracked_lsn_peek(),
+			log_get_tracked_lsn(),
 			log_sys->max_checkpoint_age);
 	}
 
@@ -4082,6 +4100,7 @@ log_shutdown(void)
 	rw_lock_free(&log_sys->checkpoint_lock);
 
 	mutex_free(&log_sys->mutex);
+	mutex_free(&log_sys->log_flush_order_mutex);
 
 #ifdef UNIV_LOG_ARCHIVE
 	rw_lock_free(&log_sys->archive_lock);

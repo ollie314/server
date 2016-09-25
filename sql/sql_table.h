@@ -247,7 +247,8 @@ bool log_drop_table(THD *thd, const char *db_name, size_t db_name_length,
                     const char *table_name, size_t table_name_length,
                     bool temporary_table);
 bool quick_rm_table(THD *thd, handlerton *base, const char *db,
-                    const char *table_name, uint flags);
+                    const char *table_name, uint flags,
+                    const char *table_path=0);
 void close_cached_table(THD *thd, TABLE *table);
 void sp_prepare_create_field(THD *thd, Create_field *sql_field);
 int prepare_create_field(Create_field *sql_field,
@@ -283,5 +284,7 @@ uint explain_filename(THD* thd, const char *from, char *to, uint to_length,
 
 extern MYSQL_PLUGIN_IMPORT const char *primary_key_name;
 extern mysql_mutex_t LOCK_gdl;
+
+bool check_engine(THD *, const char *, const char *, HA_CREATE_INFO *);
 
 #endif /* SQL_TABLE_INCLUDED */

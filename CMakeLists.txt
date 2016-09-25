@@ -56,6 +56,15 @@ ENDIF()
 SET(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING
    "Choose the type of build, options are: None(CMAKE_CXX_FLAGS or CMAKE_C_FLAGS used) Debug Release RelWithDebInfo MinSizeRel")
 
+# MAX_INDEXES - Set the maximum number of indexes per table, default 64U
+IF (NOT MAX_INDEXES)
+  SET(MAX_INDEXES 64U)
+ENDIF(NOT MAX_INDEXES)
+
+IF (${MAX_INDEXES} GREATER 128)
+  MESSAGE(FATAL_ERROR "MAX_INDEXES values greater than 128 is not supported!")
+ENDIF()
+
 IF(UNIX AND NOT APPLE)
   # Note, that generally one should not change settings depending
   # on CMAKE_BUILD_TYPE, because VS and Xcode configure once (with
@@ -134,11 +143,11 @@ ENDIF(NOT CPACK_GENERATOR)
 INCLUDE(mysql_version)
 INCLUDE(cpack_source_ignore_files)
 INCLUDE(install_layout)
+INCLUDE(wsrep)
 INCLUDE(cpack_rpm)
 INCLUDE(cpack_deb)
 
 # Add macros
-INCLUDE(wsrep)
 INCLUDE(character_sets)
 INCLUDE(cpu_info)
 INCLUDE(zlib)
@@ -151,6 +160,7 @@ INCLUDE(pcre)
 INCLUDE(ctest)
 INCLUDE(plugin)
 INCLUDE(install_macros)
+INCLUDE(systemd)
 INCLUDE(mysql_add_executable)
 
 # Handle options
@@ -177,12 +187,16 @@ IF (WITH_ASAN)
   # gcc 4.8.1 and new versions of clang
   MY_CHECK_AND_SET_COMPILER_FLAG("-fsanitize=address -O1 -Wno-error -fPIC"
     DEBUG RELWITHDEBINFO)
+  SET(HAVE_C_FSANITIZE ${HAVE_C__fsanitize_address__O1__Wno_error__fPIC})
+  SET(HAVE_CXX_FSANITIZE ${HAVE_CXX__fsanitize_address__O1__Wno_error__fPIC})
   IF(HAVE_C_FSANITIZE AND HAVE_CXX_FSANITIZE)
     SET(WITH_ASAN_OK 1)
   ELSE()
     # older versions of clang
     MY_CHECK_AND_SET_COMPILER_FLAG("-faddress-sanitizer -O1 -fPIC"
       DEBUG RELWITHDEBINFO)
+    SET(HAVE_C_FADDRESS ${HAVE_C__faddress_sanitizer__O1__fPIC})
+    SET(HAVE_CXX_FADDRESS ${HAVE_CXX__faddress_sanitizer__O1__fPIC})
     IF(HAVE_C_FADDRESS AND HAVE_CXX_FADDRESS)
       SET(WITH_ASAN_OK 1)
     ENDIF()
@@ -273,7 +287,7 @@ IF(WIN32)
   SET(SHAREDIR share)
 ELSE()
   SET(DEFAULT_MYSQL_HOME ${CMAKE_INSTALL_PREFIX})
-  SET(SHAREDIR ${DEFAULT_MYSQL_HOME}/${INSTALL_MYSQLSHAREDIR})
+  SET(SHAREDIR ${INSTALL_MYSQLSHAREDIRABS})
 ENDIF()
 
 SET(DEFAULT_BASEDIR "${DEFAULT_MYSQL_HOME}")
@@ -328,6 +342,8 @@ CHECK_JEMALLOC()
 
 CHECK_PCRE()
 
+CHECK_SYSTEMD()
+
 IF(CMAKE_CROSSCOMPILING)
   SET(IMPORT_EXECUTABLES "IMPORTFILE-NOTFOUND" CACHE FILEPATH "Path to import_executables.cmake from a native build")
   INCLUDE(${IMPORT_EXECUTABLES})
@@ -354,11 +370,9 @@ IF(WITH_UNIT_TESTS)
  ENDIF()
 ENDIF()
 
-IF(NOT WITHOUT_SERVER)
- SET (MYSQLD_STATIC_PLUGIN_LIBS "" CACHE INTERNAL "")
- # Add storage engines and plugins.
- CONFIGURE_PLUGINS()
-ENDIF()
+SET (MYSQLD_STATIC_PLUGIN_LIBS "" CACHE INTERNAL "")
+# Add storage engines and plugins.
+CONFIGURE_PLUGINS()
 
 ADD_SUBDIRECTORY(include)
 ADD_SUBDIRECTORY(dbug)
@@ -388,6 +402,10 @@ IF(NOT WITHOUT_SERVER)
   ADD_SUBDIRECTORY(mysql-test)
   ADD_SUBDIRECTORY(mysql-test/lib/My/SafeProcess)
   ADD_SUBDIRECTORY(sql-bench)
+  IF(WIN32)
+    ADD_SUBDIRECTORY(win/upgrade_wizard)
+    ADD_SUBDIRECTORY(win/packaging)
+  ENDIF()
 ENDIF()
 
 IF(UNIX)
@@ -397,11 +415,7 @@ ENDIF()
 INCLUDE(cmake/abi_check.cmake)
 INCLUDE(cmake/tags.cmake)
 
-IF(WIN32)
-  ADD_SUBDIRECTORY(win/upgrade_wizard)
-  ADD_SUBDIRECTORY(win/packaging)
-ENDIF()
-ADD_SUBDIRECTORY(packaging/solaris)
+
 
 
 INCLUDE(for_clients)

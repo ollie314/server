@@ -1693,8 +1693,8 @@ int ha_partition::change_partitions(HA_CREATE_INFO *create_info,
     } while (++i < num_parts);
   }
   if (m_reorged_parts &&
-      !(m_reorged_file= (handler**)sql_calloc(sizeof(handler*)*
-                                              (m_reorged_parts + 1))))
+      !(m_reorged_file= (handler**) thd->calloc(sizeof(handler*)*
+                                                (m_reorged_parts + 1))))
   {
     mem_alloc_error(sizeof(handler*)*(m_reorged_parts+1));
     DBUG_RETURN(HA_ERR_OUT_OF_MEM);
@@ -1725,8 +1725,9 @@ int ha_partition::change_partitions(HA_CREATE_INFO *create_info,
       }
     } while (++i < num_parts);
   }
-  if (!(new_file_array= (handler**)sql_calloc(sizeof(handler*)*
-                                            (2*(num_remain_partitions + 1)))))
+  if (!(new_file_array= ((handler**)
+                         thd->calloc(sizeof(handler*)*
+                                     (2*(num_remain_partitions + 1))))))
   {
     mem_alloc_error(sizeof(handler*)*2*(num_remain_partitions+1));
     DBUG_RETURN(HA_ERR_OUT_OF_MEM);
@@ -1810,7 +1811,7 @@ int ha_partition::change_partitions(HA_CREATE_INFO *create_info,
         DBUG_RETURN(HA_ERR_OUT_OF_MEM);
       if (p_share_refs->init(num_subparts))
         DBUG_RETURN(HA_ERR_OUT_OF_MEM);
-      if (m_new_partitions_share_refs.push_back(p_share_refs))
+      if (m_new_partitions_share_refs.push_back(p_share_refs, thd->mem_root))
         DBUG_RETURN(HA_ERR_OUT_OF_MEM);
       do
       {
@@ -2399,7 +2400,7 @@ reg_query_cache_dependant_table(THD *thd,
     DBUG_RETURN(TRUE);
   }
   (++(*block_table))->n= ++(*n);
-  if (!cache->insert_table(cache_key_len,
+  if (!cache->insert_table(thd, cache_key_len,
                            cache_key, (*block_table),
                            table_share->db.length,
                            (uint8) (cache_key_len -
@@ -5270,6 +5271,7 @@ err:
     {
       (void) m_file[j]->ha_index_end();
     }
+    destroy_record_priority_queue();
   }
   DBUG_RETURN(error);
 }
@@ -8304,7 +8306,7 @@ bool ha_partition::inplace_alter_table(TABLE *altered_table,
 /*
   Note that this function will try rollback failed ADD INDEX by
   executing DROP INDEX for the indexes that were committed (if any)
-  before the error occured. This means that the underlying storage
+  before the error occurred. This means that the underlying storage
   engine must be able to drop index in-place with X-lock held.
   (As X-lock will be held here if new indexes are to be committed)
 */

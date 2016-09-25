@@ -27,7 +27,6 @@
 #include "sql_delete.h"
 #include "sql_cache.h"                          // query_cache_*
 #include "sql_base.h"                           // open_temprary_table
-#include "sql_table.h"                         // build_table_filename
 #include "lock.h"                              // unlock_table_name
 #include "sql_view.h"             // check_key_in_view, mysql_frm_type
 #include "sql_parse.h"            // mysql_init_select
@@ -159,7 +158,7 @@ void Update_plan::save_explain_data_intern(MEM_ROOT *mem_root,
   explain->where_cond= select? select->cond: NULL;
 
   if (using_filesort)
-    explain->filesort_tracker= new (mem_root) Filesort_tracker;
+    explain->filesort_tracker= new (mem_root) Filesort_tracker(is_analyze);
   explain->using_io_buffer= using_io_buffer;
 
   append_possible_keys(mem_root, explain->possible_keys, table, 
@@ -484,6 +483,9 @@ bool mysql_delete(THD *thd, TABLE_LIST *table_list, COND *conds,
   DBUG_EXECUTE_IF("show_explain_probe_delete_exec_start", 
                   dbug_serve_apcs(thd, 1););
 
+  if (!(select && select->quick))
+    status_var_increment(thd->status_var.delete_scan_count);
+
   if (query_plan.using_filesort)
   {
     ha_rows examined_rows;
@@ -499,7 +501,7 @@ bool mysql_delete(THD *thd, TABLE_LIST *table_list, COND *conds,
       Filesort_tracker *fs_tracker= 
         thd->lex->explain->get_upd_del_plan()->filesort_tracker;
 
-      if (!(sortorder= make_unireg_sortorder(thd, order, &length, NULL)) ||
+      if (!(sortorder= make_unireg_sortorder(thd, NULL, 0, order, &length, NULL)) ||
 	  (table->sort.found_records= filesort(thd, table, sortorder, length,
                                                select, HA_POS_ERROR,
                                                true,
@@ -529,17 +531,18 @@ bool mysql_delete(THD *thd, TABLE_LIST *table_list, COND *conds,
     free_underlaid_joins(thd, select_lex);
     DBUG_RETURN(TRUE);
   }
+
   if (query_plan.index == MAX_KEY || (select && select->quick))
-  {
-    if (init_read_record(&info, thd, table, select, 1, 1, FALSE))
-    {
-      delete select;
-      free_underlaid_joins(thd, select_lex);
-      DBUG_RETURN(TRUE);
-    }
-  }
+    error= init_read_record(&info, thd, table, select, 1, 1, FALSE);
   else
-    init_read_record_idx(&info, thd, table, 1, query_plan.index, reverse);
+    error= init_read_record_idx(&info, thd, table, 1, query_plan.index,
+                                reverse);
+  if (error)
+  {
+    delete select;
+    free_underlaid_joins(thd, select_lex);
+    DBUG_RETURN(TRUE);
+  }
 
   init_ftfuncs(thd, select_lex, 1);
   THD_STAGE_INFO(thd, stage_updating);
@@ -906,7 +909,7 @@ multi_delete::multi_delete(THD *thd_arg, TABLE_LIST *dt, uint num_of_tables_arg)
     num_of_tables(num_of_tables_arg), error(0),
     do_delete(0), transactional_tables(0), normal_tables(0), error_handled(0)
 {
-  tempfiles= (Unique **) sql_calloc(sizeof(Unique *) * num_of_tables);
+  tempfiles= (Unique **) thd_arg->calloc(sizeof(Unique *) * num_of_tables);
 }
 
 

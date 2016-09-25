@@ -65,6 +65,12 @@ extern "C" sig_handler handle_fatal_signal(int sig)
 #ifdef HAVE_STACKTRACE
   THD *thd;
 #endif
+  /*
+     This flag remembers if the query pointer was found invalid.
+     We will try and print the query at the end of the signal handler, in case
+     we're wrong.
+  */
+  bool print_invalid_query_pointer= false;
 
   if (segfaulted)
   {
@@ -100,7 +106,7 @@ extern "C" sig_handler handle_fatal_signal(int sig)
     "or misconfigured. This error can also be caused by malfunctioning hardware.\n\n");
 
   my_safe_printf_stderr("%s",
-                        "To report this bug, see http://kb.askmonty.org/en/reporting-bugs\n\n");
+                        "To report this bug, see https://mariadb.com/kb/en/reporting-bugs\n\n");
 
   my_safe_printf_stderr("%s",
     "We will try our best to scrape up some info that will hopefully help\n"
@@ -110,8 +116,9 @@ extern "C" sig_handler handle_fatal_signal(int sig)
   set_server_version();
   my_safe_printf_stderr("Server version: %s\n", server_version);
 
-  my_safe_printf_stderr("key_buffer_size=%lu\n",
-                        (ulong) dflt_key_cache->key_cache_mem_size);
+  if (dflt_key_cache)
+    my_safe_printf_stderr("key_buffer_size=%lu\n",
+                          (ulong) dflt_key_cache->key_cache_mem_size);
 
   my_safe_printf_stderr("read_buffer_size=%ld\n",
                         (long) global_system_variables.read_buff_size);
@@ -119,24 +126,30 @@ extern "C" sig_handler handle_fatal_signal(int sig)
   my_safe_printf_stderr("max_used_connections=%lu\n",
                         (ulong) max_used_connections);
 
-  my_safe_printf_stderr("max_threads=%u\n",
-                        (uint) thread_scheduler->max_threads +
-                        (uint) extra_max_connections);
+  if (thread_scheduler)
+    my_safe_printf_stderr("max_threads=%u\n",
+                          (uint) thread_scheduler->max_threads +
+                          (uint) extra_max_connections);
 
   my_safe_printf_stderr("thread_count=%u\n", (uint) thread_count);
 
-  my_safe_printf_stderr("It is possible that mysqld could use up to \n"
-                        "key_buffer_size + "
-                        "(read_buffer_size + sort_buffer_size)*max_threads = "
-                        "%lu K  bytes of memory\n",
-                        (ulong)(dflt_key_cache->key_cache_mem_size +
-                         (global_system_variables.read_buff_size +
-                          global_system_variables.sortbuff_size) *
-                         (thread_scheduler->max_threads + extra_max_connections) +
-                         (max_connections + extra_max_connections)* sizeof(THD)) / 1024);
-
-  my_safe_printf_stderr("%s",
-    "Hope that's ok; if not, decrease some variables in the equation.\n\n");
+  if (dflt_key_cache && thread_scheduler)
+  {
+    my_safe_printf_stderr("It is possible that mysqld could use up to \n"
+                          "key_buffer_size + "
+                          "(read_buffer_size + sort_buffer_size)*max_threads = "
+                          "%lu K  bytes of memory\n",
+                          (ulong)
+                          (dflt_key_cache->key_cache_mem_size +
+                           (global_system_variables.read_buff_size +
+                            global_system_variables.sortbuff_size) *
+                           (thread_scheduler->max_threads + extra_max_connections) +
+                           (max_connections + extra_max_connections) *
+                           sizeof(THD)) / 1024);
+    my_safe_printf_stderr("%s",
+                          "Hope that's ok; if not, decrease some variables in "
+                          "the equation.\n\n");
+  }
 
 #ifdef HAVE_STACKTRACE
   thd= current_thd;
@@ -194,7 +207,12 @@ extern "C" sig_handler handle_fatal_signal(int sig)
       "Some pointers may be invalid and cause the dump to abort.\n");
 
     my_safe_printf_stderr("Query (%p): ", thd->query());
-    my_safe_print_str(thd->query(), MY_MIN(65536U, thd->query_length()));
+    if (my_safe_print_str(thd->query(), MY_MIN(65536U, thd->query_length())))
+    {
+      // Query was found invalid. We will try to print it at the end.
+      print_invalid_query_pointer= true;
+    }
+
     my_safe_printf_stderr("\nConnection ID (thread ID): %lu\n",
                           (ulong) thd->thread_id);
     my_safe_printf_stderr("Status: %s\n\n", kreason);
@@ -220,7 +238,7 @@ extern "C" sig_handler handle_fatal_signal(int sig)
   if (calling_initgroups)
   {
     my_safe_printf_stderr("%s", "\n"
-      "This crash occured while the server was calling initgroups(). This is\n"
+      "This crash occurred while the server was calling initgroups(). This is\n"
       "often due to the use of a mysqld that is statically linked against \n"
       "glibc and configured to use LDAP in /etc/nsswitch.conf.\n"
       "You will need to either upgrade to a version of glibc that does not\n"
@@ -256,6 +274,16 @@ extern "C" sig_handler handle_fatal_signal(int sig)
       "You should consider whether you really need the "
       "\"--memlock\" parameter and/or consult the OS distributer about "
       "\"mlockall\" bugs.\n");
+  }
+
+  if (print_invalid_query_pointer)
+  {
+    my_safe_printf_stderr(
+        "\nWe think the query pointer is invalid, but we will try "
+        "to print it anyway. \n"
+        "Query: ");
+    my_write_stderr(thd->query(), MY_MIN(65536U, thd->query_length()));
+    my_safe_printf_stderr("\n\n");
   }
 
 #ifdef HAVE_WRITE_CORE

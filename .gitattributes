@@ -9,12 +9,14 @@
 *.cpp text
 *.h text
 *.test text
+*.java text
 
 # These files should be checked out as is
 *.result -text -whitespace
 *.dat -text -whitespace
 
 storage/connect/mysql-test/connect/std_data/*.txt -text
+pcre/testdata/greppatN4 -text
 
 # Denote all files that are truly binary and should not be modified.
 *.png binary
@@ -22,9 +24,11 @@ storage/connect/mysql-test/connect/std_data/*.txt -text
 *.frm binary
 *.MYD binary
 *.MYI binary
+*.class binary
 
 *.c     diff=cpp
 *.h     diff=cpp
 *.cc    diff=cpp
 *.ic    diff=cpp
 *.cpp   diff=cpp
+*.java  diff=cpp

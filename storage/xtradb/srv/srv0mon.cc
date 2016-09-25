@@ -2,7 +2,7 @@
 
 Copyright (c) 2010, 2014, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2012, Facebook Inc.
-Copyright (c) 2013, 2014, MariaDB Corporation
+Copyright (c) 2013, 2016, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -308,6 +308,12 @@ static monitor_info_t	innodb_counter_info[] =
 	 static_cast<monitor_type_t>(
 	 MONITOR_EXISTING | MONITOR_DEFAULT_ON),
 	 MONITOR_DEFAULT_START, MONITOR_OVLD_PAGES_READ},
+
+	{"buffer_pages0_read", "buffer",
+	 "Number of page 0 read (innodb_pages0_read)",
+	 static_cast<monitor_type_t>(
+	 MONITOR_EXISTING | MONITOR_DEFAULT_ON),
+	 MONITOR_DEFAULT_START, MONITOR_OVLD_PAGES0_READ},
 
 	{"buffer_index_sec_rec_cluster_reads", "buffer",
 	 "Number of secondary record reads triggered cluster read",
@@ -1196,6 +1202,16 @@ static monitor_info_t	innodb_counter_info[] =
 	 MONITOR_NONE,
 	 MONITOR_DEFAULT_START, MONITOR_SRV_DICT_LRU_MICROSECOND},
 
+	{"innodb_dict_lru_count_active", "server",
+	 "Number of tables evicted from DICT LRU list in the active loop",
+	 MONITOR_NONE,
+	 MONITOR_DEFAULT_START, MONITOR_SRV_DICT_LRU_EVICT_COUNT_ACTIVE},
+
+	{"innodb_dict_lru_count_idle", "server",
+	 "Number of tables evicted from DICT LRU list in the idle loop",
+	 MONITOR_NONE,
+	 MONITOR_DEFAULT_START, MONITOR_SRV_DICT_LRU_EVICT_COUNT_IDLE},
+
 	{"innodb_checkpoint_usec", "server",
 	 "Time (in microseconds) spent by master thread to do checkpoint",
 	 MONITOR_NONE,
@@ -1703,6 +1719,11 @@ srv_mon_process_existing_counter(
 	case MONITOR_OVLD_PAGES_READ:
 		buf_get_total_stat(&stat);
 		value = stat.n_pages_read;
+		break;
+
+	/* innodb_pages0_read */
+	case MONITOR_OVLD_PAGES0_READ:
+		value = srv_stats.page0_read;
 		break;
 
 	/* Number of times secondary index lookup triggered cluster lookup */

@@ -5,7 +5,7 @@
 /*                                                                     */
 /* COPYRIGHT:                                                          */
 /* ----------                                                          */
-/*  (C) Copyright to PlugDB Software Development          2008-2015    */
+/*  (C) Copyright to PlugDB Software Development          2008-2016    */
 /*  Author: Olivier BERTRAND                                           */
 /*                                                                     */
 /* WHAT THIS PROGRAM DOES:                                             */
@@ -130,10 +130,10 @@ bool TBLDEF::DefineAM(PGLOBAL g, LPCSTR, int)
 
       // Allocate the TBLIST block for that table
       tbl = new(g) XTAB(pn, def);
-      tbl->SetQualifier(pdb);
+      tbl->SetSchema(pdb);
       
       if (trace)
-        htrc("TBL: Name=%s db=%s\n", tbl->GetName(), tbl->GetQualifier());
+        htrc("TBL: Name=%s db=%s\n", tbl->GetName(), tbl->GetSchema());
 
       // Link the blocks
       if (Tablep)
@@ -569,6 +569,9 @@ pthread_handler_t ThreadOpen(void *p)
   if (!my_thread_init()) {
     set_current_thd(cmp->Thd);
 
+		if (trace)
+			htrc("ThreadOpen: Thd=%d\n", cmp->Thd);
+
     // Try to open the connection
     if (!cmp->Tap->GetTo_Tdb()->OpenDB(cmp->G)) {
       cmp->Ready = true;
@@ -604,10 +607,15 @@ void TDBTBM::ResetDB(void)
     if (colp->GetAmType() == TYPE_AM_TABID)
       colp->COLBLK::Reset();
 
+	// Local tables
   for (PTABLE tabp = Tablist; tabp; tabp = tabp->GetNext())
     ((PTDBASE)tabp->GetTo_Tdb())->ResetDB();
 
-  Tdbp = (PTDBASE)Tablist->GetTo_Tdb();
+	// Remote tables
+	for (PTBMT tp = Tmp; tp; tp = tp->Next)
+		((PTDBASE)tp->Tap->GetTo_Tdb())->ResetDB();
+
+  Tdbp = (Tablist) ? (PTDBASE)Tablist->GetTo_Tdb() : NULL;
   Crp = 0;
   } // end of ResetDB
 
@@ -679,7 +687,7 @@ bool TDBTBM::OpenDB(PGLOBAL g)
     /*  Table already open, replace it at its beginning.               */
     /*******************************************************************/
     ResetDB();
-    return Tdbp->OpenDB(g);  // Re-open fist table
+    return (Tdbp) ? Tdbp->OpenDB(g) : false;  // Re-open fist table
     } // endif use
 
 #if 0
