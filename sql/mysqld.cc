@@ -4096,6 +4096,7 @@ static int init_common_variables()
 
   max_system_variables.pseudo_thread_id= (ulong)~0;
   server_start_time= flush_status_time= my_time(0);
+  my_disable_copystat_in_redel= 1;
 
   global_rpl_filter= new Rpl_filter;
   binlog_filter= new Rpl_filter;
@@ -5076,6 +5077,12 @@ static int init_server_components()
   }
 
   /*
+    Since some wsrep threads (THDs) are create before plugins are
+    initialized, LOCK_plugin mutex needs to be initialized here.
+  */
+  plugin_mutex_init();
+
+  /*
     Wsrep initialization must happen at this point, because:
     - opt_bin_logname must be known when starting replication
       since SST may need it
@@ -5303,6 +5310,17 @@ static int init_server_components()
 #endif
 
 #ifdef WITH_WSREP
+  /*
+    Now is the right time to initialize members of wsrep startup threads
+    that rely on plugins and other related global system variables to be
+    initialized. This initialization was not possible before, as plugins
+    (and thus some global system variables) are initialized after wsrep
+    startup threads are created.
+    Note: This only needs to be done for rsync, xtrabackup based SST methods.
+  */
+  if (wsrep_before_SE())
+    wsrep_plugins_post_init();
+
   if (WSREP_ON && !opt_bin_log)
   {
     wsrep_emulate_bin_log= 1;
